@@ -2,9 +2,13 @@ name = "notion-sprint-worker"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
-# Cron Triggers (UTC). Example: 00:00 UTC = 09:00 JST.
-# デフォルト: 本番と同じ設定を想定。env.* セクションで上書き可。
-triggers = { crons = ["0 0 * * *"] }
+# Cron Triggers (UTC).
+# 20:00 UTC = 05:00 JST (進捗SPスナップショット保存)
+# 00:00 UTC = 09:00 JST (担当者通知)
+# 00:10-00:50 UTC = 09:10-09:50 JST (10分毎: 担当者リマインド)
+# 01:00 UTC = 10:00 JST (PMレポート)
+# 毎時 :00/:15 = ☎️リマインド(常時) + PM未返信(11-19JST) + EOD(0:00JST)
+triggers = { crons = ["0 20 * * *", "0 0 * * *", "10,20,30,40,50 0 * * *", "0 1 * * *", "0,15 * * * *"] }
 
 [observability]
 enabled = true
@@ -12,8 +16,8 @@ enabled = true
 # Replace with your KV namespace IDs.
 [[kv_namespaces]]
 binding = "NOTIFY_CACHE"
-id = "2185f8f0b58142d7a7f7c3fc5e29447f"
-preview_id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+id = "0d755a2c50404149ad9c03c4d7d2fad5"
+preview_id = "0d755a2c50404149ad9c03c4d7d2fad5"
 
 [vars]
 OPENAI_MODEL = "gpt-4.1-mini"
@@ -25,8 +29,8 @@ name = "notion-sprint-worker-dev"
 triggers = { crons = ["0 23 * * *"] } # 08:00 JST 相当
 [[env.dev.kv_namespaces]]
 binding = "NOTIFY_CACHE"
-id = "2185f8f0b58142d7a7f7c3fc5e29447f"
-preview_id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+id = "0d755a2c50404149ad9c03c4d7d2fad5"
+preview_id = "0d755a2c50404149ad9c03c4d7d2fad5"
 
 [env.dev.vars]
 OPENAI_MODEL = "gpt-4.1-mini"

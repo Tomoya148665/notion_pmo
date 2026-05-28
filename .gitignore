@@ -209,4 +209,4 @@ __marimo__/
 
 node_modules
 .dev.vars
-readme.md
+.wrangler/
