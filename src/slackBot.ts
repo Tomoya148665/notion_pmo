@@ -220,6 +220,18 @@ export async function usersInfo(
   };
 }
 
+export async function conversationsInfo(
+  token: string,
+  channel: string
+): Promise<{ name: string }> {
+  const data = (await slackApiCall(token, "conversations.info", {
+    channel
+  })) as { channel?: { name?: string } };
+  return {
+    name: data.channel?.name ?? ""
+  };
+}
+
 export async function authTest(
   token: string
 ): Promise<{ userId: string; botId: string }> {

@@ -22,7 +22,8 @@ import {
   savePhoneReminder,
   deletePhoneReminder
 } from "./workflow";
-import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen } from "./slackBot";
+import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen, conversationsInfo, usersInfo } from "./slackBot";
+import { ensureProjectCatalog, resolveProjectFromCache } from "./projectCatalog";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
 import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchPageTitles } from "./notionApi";
@@ -613,7 +614,9 @@ async function handleMention(
       rawChannelMsgs,
       threadStateResult,
       conversationHistoryResult,
-      pendingCreateRefResult
+      pendingCreateRefResult,
+      channelInfoResult,
+      cachedProjectsResult
     ] = await Promise.all([
       fetchMembers(config).catch(() => []),
       fetchSprintCapacity(config, summary.sprint.id).catch(() => []),
@@ -633,7 +636,9 @@ async function handleMention(
       // KV lookups (parallelized with above)
       getThreadState(env.NOTIFY_CACHE, channel, threadTs).catch(() => null),
       getMentionHistory(env.NOTIFY_CACHE, channel, threadTs).catch(() => [] as Array<{ role: "user" | "assistant"; content: string }>),
-      getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs).catch(() => null)
+      getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs).catch(() => null),
+      conversationsInfo(config.slackBotToken, channel).catch(() => ({ name: "" })),
+      ensureProjectCatalog(env, config).catch(() => [])
     ]);
 
     // Merge capacity data into members
@@ -737,7 +742,11 @@ async function handleMention(
         name: s.name,
         start_date: s.start_date,
         end_date: s.end_date
-      }))
+      })),
+      ...(channelInfoResult.name ? { channelName: channelInfoResult.name } : {}),
+      ...(cachedProjectsResult.length > 0
+        ? { availableProjects: cachedProjectsResult.map((p) => ({ id: p.id, name: p.name })) }
+        : {})
     };
 
     // Resolve Slack user ID → member name for "自分" resolution
@@ -750,6 +759,38 @@ async function handleMention(
         slackIdToName.set(m.slackUserId, m.name);
       }
     }
+
+    // Fallback: resolve unknown User IDs via Slack users.info
+    // (covers people not registered in the Notion member DB)
+    const unknownIds = new Set<string>();
+    const collectId = (uid: string) => {
+      if (uid && !slackIdToName.has(uid)) unknownIds.add(uid);
+    };
+    const collectMentions = (text: string) => {
+      for (const match of text.matchAll(/<@([A-Z0-9]+)>/g)) collectId(match[1]);
+    };
+    for (const m of rawThreadMsgs) {
+      collectId(m.user);
+      collectMentions(m.text);
+    }
+    for (const m of rawChannelMsgs) {
+      collectId(m.user);
+      collectMentions(m.text);
+    }
+    if (unknownIds.size > 0) {
+      const token = config.slackBotToken;
+      const resolved = await Promise.all(
+        [...unknownIds].map(async (uid) => {
+          const info = await usersInfo(token, uid).catch(() => null);
+          const name = info ? (info.displayName || info.realName) : "";
+          return [uid, name] as const;
+        })
+      );
+      for (const [uid, name] of resolved) {
+        if (name) slackIdToName.set(uid, name);
+      }
+    }
+
     const resolveSlackMentions = (text: string): string =>
       text.replace(/<@([A-Z0-9]+)>/g, (_, id) => {
         const name = slackIdToName.get(id);
@@ -906,17 +947,21 @@ async function handleMention(
           resolvedProjectIds = [];
           projectDisplay = null;
         } else if (newTask.project) {
-          const candidates = await searchProjectsByName(config.notionToken, newTask.project, config.projectDbId);
-
-          if (candidates.length === 0) {
-            resolvedProjectIds = [];
-            projectDisplay = `${newTask.project}（⚠️ 未検出、プロジェクト未設定）`;
-          } else if (candidates.length === 1) {
-            resolvedProjectIds = [candidates[0].id];
-            projectDisplay = candidates[0].name;
+          // 1) キャッシュ参照（チームプロジェクトカタログから正規名で解決）
+          const cachedHit = resolveProjectFromCache(cachedProjectsResult, newTask.project);
+          if (cachedHit) {
+            resolvedProjectIds = [cachedHit.id];
+            projectDisplay = cachedHit.name;
           } else {
-            resolvedProjectIds = [candidates[0].id];
-            projectDisplay = candidates[0].name;
+            // 2) フォールバック: Notion /v1/search (新規プロジェクト追加直後など)
+            const candidates = await searchProjectsByName(config.notionToken, newTask.project, config.projectDbId);
+            if (candidates.length === 0) {
+              resolvedProjectIds = [];
+              projectDisplay = `${newTask.project}（⚠️ 未検出、プロジェクト未設定）`;
+            } else {
+              resolvedProjectIds = [candidates[0].id];
+              projectDisplay = candidates[0].name;
+            }
           }
         } else {
           // null — use default project from sprint (pick only the most common one)

@@ -31,6 +31,7 @@ import {
   matchTasksToSchedule
 } from "./llmAnalyzer";
 import { chatPostMessage, conversationsOpen } from "./slackBot";
+import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -1735,6 +1736,17 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
+  if (path === "/pmo/refresh-projects") {
+    const result = await refreshProjectCatalog(env);
+    return jsonResponse({ ok: true, ...result });
+  }
+
+  if (path === "/pmo/projects") {
+    const config = getConfig(env);
+    const projects = await getCachedProjects(env.NOTIFY_CACHE, config.teamFilter);
+    return jsonResponse({ ok: true, teamFilter: config.teamFilter, count: projects.length, projects });
+  }
+
   if (path === "/query" && request.method === "POST") {
     let body: Record<string, unknown>;
     try {
@@ -1899,8 +1911,9 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Branch by cron expression
     if (event.cron === "0 20 * * *") {
-      // 05:00 JST — Save progress SP snapshot
+      // 05:00 JST — Save progress SP snapshot + refresh project catalog
       ctx.waitUntil(runProgressSpSnapshot(env, "cron"));
+      ctx.waitUntil(refreshProjectCatalog(env));
     } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runForAllChannels(env, (ch) => runMorningFlow(env, "cron", null, ch)));

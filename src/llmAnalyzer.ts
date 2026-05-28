@@ -593,7 +593,12 @@ export async function interpretMention(
 
 **create_task（タスク追加）**: 新しいタスクをNotionに追加するリクエスト
 - 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限 YYYY-MM-DD）、sp（SP）
-- オプション項目: project（プロジェクト名）- ユーザーが指定した場合のみセット。未指定ならnull（チャンネルのデフォルトプロジェクトが使われる）。「プロジェクトはなし」「プロジェクトなしで」等と明示的にプロジェクトを外す指示があった場合は空文字""をセット
+- オプション項目: project（プロジェクト名）- available_projects（チームが対応中のプロジェクト一覧）に存在する name を必ず使う。リスト外の名前を返してはならない。判断手順:
+  1. ユーザーが明示的にプロジェクト名を指定 → available_projects の中で最も近い候補の name をそのままセット
+  2. 明示なし → channel_name、thread_context、task_name の総合判断で available_projects から最適な1件を選んでセット（チャンネル名は最強のヒント。例: channel_name="proj-mitsui" → "三井住友海上" が最有力）
+  3. available_projects に当てはまる候補が一つもない → null（システムがデフォルトプロジェクトを補完する）
+  4. ユーザーが「プロジェクトはなし」「プロジェクトなしで」等と明示的に外した場合 → 空文字 ""
+  5. available_projects が提供されていない場合 → null
 - オプション項目: description（概要）- システムが自動生成した概要。ユーザーが修正を依頼した場合のみ変更する
 - オプション項目: sprint（スプリント名）- available_sprintsに含まれるスプリント名を指定する。ユーザーが「スプリントに入れて」「現スプリントに追加」等と指定した場合にセットする。未指定またはユーザーが「スプリントはまだ設定しないで」等と指示した場合はnull。⚠️「バックログ」はステータスの値であってスプリント名ではない — sprintに"バックログ"を入れないこと。デフォルトはnull
 - 複数タスクの同時作成に対応: スレッド内容から複数のタスクが識別できる場合、new_tasksに複数のタスクを含める
@@ -635,7 +640,7 @@ export async function interpretMention(
   - ステータスに言及していない修正の場合 → pending_create_tasksのstatusをそのまま引き継ぐ
 - プロジェクト（project）の修正:
   - 「プロジェクトはなし」「プロジェクト外して」「プロジェクトなしで」→ projectを""（空文字）にセット
-  - 「プロジェクトは○○」「プロジェクトを○○にして」→ projectに○○の部分だけをセット（「タスク作成」「変更」等の操作名を含めない。例: 「プロジェクトを明安にして」→ project="明安"）
+  - 「プロジェクトは○○」「プロジェクトを○○にして」→ available_projects の中で○○に最も近い候補の name をセット（available_projectsが提供されていない場合のみ、○○の部分をそのままセット）
   - プロジェクトに言及していない修正の場合 → pending_create_tasksのprojectをそのまま引き継ぐ
 - スプリント（sprint）の修正:
   - 「スプリントに入れて」「現スプリントに追加」→ available_sprintsから該当スプリント名をsprintにセット
@@ -774,6 +779,8 @@ export async function interpretMention(
     weekly_diff: context.weeklyDiff,
     stagnant_tasks: context.stagnantTasks,
     available_sprints: context.availableSprints,
+    ...(context.channelName ? { channel_name: context.channelName } : {}),
+    ...(context.availableProjects && context.availableProjects.length > 0 ? { available_projects: context.availableProjects } : {}),
     ...(pendingCreateTasks && pendingCreateTasks.length > 0 ? { pending_create_tasks: pendingCreateTasks } : {}),
     ...(pendingUpdateActions ? { pending_update_actions: pendingUpdateActions } : {}),
     ...(threadContext && threadContext.length > 0 ? { thread_context: threadContext } : {}),

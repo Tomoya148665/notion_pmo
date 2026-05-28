@@ -197,6 +197,8 @@ export interface MentionContext {
     start_date: string;
     end_date: string;
   }>;
+  channelName?: string;
+  availableProjects?: Array<{ id: string; name: string }>;
 }
 
 // ── PMO Agent schemas ──────────────────────────────────────────────────────
