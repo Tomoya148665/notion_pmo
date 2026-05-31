@@ -9,8 +9,10 @@ interface PageUpdates {
   sp?: number;
   /** Status name as it appears in Notion */
   status?: string;
-  /** Assignee name (auto-resolved to Notion user ID) */
+  /** Assignee name (auto-resolved to Notion user ID if assigneeId not given) */
   assignee?: string;
+  /** Pre-resolved Notion user ID (from buildAssigneeResolver); takes precedence over assignee name lookup */
+  assigneeId?: string;
 }
 
 // ── Notion user ID mapping (name → ID) ─────────────────────────────────────
@@ -157,9 +159,22 @@ export async function updateTaskPage(
   if (updates.status !== undefined) {
     properties["ステータス"] = { status: { name: updates.status } };
   }
-  if (updates.assignee !== undefined) {
+  if (updates.assigneeId !== undefined) {
+    // Pre-resolved ID from buildAssigneeResolver — use directly, skip all name lookup
+    properties["担当者"] = { people: [{ id: updates.assigneeId }] };
+  } else if (updates.assignee !== undefined) {
     const userMap = await fetchNotionUserMap(token);
     let notionUserId = userMap.get(updates.assignee);
+
+    // Partial match fallback within users.list (e.g. "古鉄" → "古鉄朋也 / Tomoya Kotetsu")
+    if (!notionUserId) {
+      for (const [name, id] of userMap) {
+        if (name.includes(updates.assignee) || updates.assignee.includes(name)) {
+          notionUserId = id;
+          break;
+        }
+      }
+    }
 
     // Fallback: resolve from page's parent database if users.list doesn't have the user
     if (!notionUserId && pageId) {
@@ -175,6 +190,15 @@ export async function updateTaskPage(
           if (pageData.parent?.type === "database_id" && pageData.parent.database_id) {
             const dbUserMap = await buildUserMapFromDatabase(token, pageData.parent.database_id);
             notionUserId = dbUserMap.get(updates.assignee);
+            // Partial match within the parent DB's people (e.g. "金田" → "金田浩樹")
+            if (!notionUserId) {
+              for (const [name, id] of dbUserMap) {
+                if (name.includes(updates.assignee) || updates.assignee.includes(name)) {
+                  notionUserId = id;
+                  break;
+                }
+              }
+            }
           }
         }
       } catch (err) {

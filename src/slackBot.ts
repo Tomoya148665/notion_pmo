@@ -207,11 +207,38 @@ export async function conversationsMembers(
   return data.members ?? [];
 }
 
+// NOTE: Slack の users.info / conversations.info は POST+JSON で user/channel パラメータを
+// 受け付けない（user_not_found / invalid_arguments になる）。GET + query string で呼ぶこと。
+async function slackApiGet(
+  token: string,
+  method: string,
+  params: Record<string, string>
+): Promise<unknown> {
+  const qs = new URLSearchParams(params).toString();
+  return withRetry(
+    async () => {
+      const res = await fetch(`https://slack.com/api/${method}?${qs}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error(`Slack API HTTP error: ${res.status} ${method}`);
+      }
+      const data = (await res.json()) as { ok: boolean; error?: string };
+      if (!data.ok) {
+        throw new Error(`Slack API error [${method}]: ${data.error ?? "unknown"}`);
+      }
+      return data;
+    },
+    { label: `Slack ${method}` }
+  );
+}
+
 export async function usersInfo(
   token: string,
   userId: string
 ): Promise<{ realName: string; displayName: string }> {
-  const data = (await slackApiCall(token, "users.info", {
+  const data = (await slackApiGet(token, "users.info", {
     user: userId
   })) as { user?: { real_name?: string; profile?: { display_name?: string } } };
   return {
@@ -224,7 +251,7 @@ export async function conversationsInfo(
   token: string,
   channel: string
 ): Promise<{ name: string }> {
-  const data = (await slackApiCall(token, "conversations.info", {
+  const data = (await slackApiGet(token, "conversations.info", {
     channel
   })) as { channel?: { name?: string } };
   return {

@@ -113,5 +113,31 @@ export async function fetchMembers(config: AppConfig): Promise<Member[]> {
     }
   }
 
+  // MEMBER_EXTRA で指定された追加メンバー(キーが表示名)を members リストに足す
+  // 既に同名がいる場合はスキップ
+  const extraNames = Object.keys(config.memberExtra);
+  for (const extraName of extraNames) {
+    const exists = members.some(
+      (m) => m.name === extraName || m.name.includes(extraName) || extraName.includes(m.name)
+    );
+    if (!exists) {
+      members.push({ name: extraName, spRate: 1 });
+      console.log(`fetchMembers: added extra member "${extraName}"`);
+    }
+  }
+
+  // MEMBER_EXCLUDE で除外指定された名前(部分一致)を取り除く
+  const excludeList = config.memberExclude;
+  if (excludeList.length > 0) {
+    const before = members.length;
+    const filtered = members.filter(
+      (m) => !excludeList.some((ex) => m.name.includes(ex) || ex.includes(m.name))
+    );
+    if (filtered.length !== before) {
+      console.log(`fetchMembers: excluded ${before - filtered.length} member(s) via MEMBER_EXCLUDE`);
+    }
+    return filtered;
+  }
+
   return members;
 }

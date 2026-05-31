@@ -38,7 +38,7 @@ Notion + Slack + Google Sheets + OpenAI LLM を連携した、Cloudflare Workers
 ### 手順
 
 ```bash
-git clone https://github.com/kitagawakaede/notion_pmo.git
+git clone https://github.com/Tomoya148665/notion_pmo.git
 cd notion_pmo
 npm install
 
@@ -56,7 +56,7 @@ npx wrangler dev          # ローカル動作確認
 npx wrangler deploy
 ```
 
-→ 即時に `notion-sprint-worker.kaede-pmo.workers.dev` に反映される。
+→ 即時に `notion-sprint-worker-dev.tomoya-kotetsu.workers.dev` に反映される。
 
 ---
 
@@ -129,7 +129,7 @@ CLAUDE.md                 # 開発ルール（必読）
 
 ## 管理用 HTTP エンドポイント
 
-`https://notion-sprint-worker.kaede-pmo.workers.dev` 配下:
+`https://notion-sprint-worker-dev.tomoya-kotetsu.workers.dev` 配下:
 
 | Path | 用途 |
 |---|---|

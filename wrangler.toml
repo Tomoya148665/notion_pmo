@@ -1,37 +1,31 @@
-name = "notion-sprint-worker"
+name = "notion-sprint-worker-dev"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
-# Cron Triggers (UTC).
-# 20:00 UTC = 05:00 JST (進捗SPスナップショット保存)
-# 00:00 UTC = 09:00 JST (担当者通知)
-# 00:10-00:50 UTC = 09:10-09:50 JST (10分毎: 担当者リマインド)
-# 01:00 UTC = 10:00 JST (PMレポート)
-# 毎時 :00/:15 = ☎️リマインド(常時) + PM未返信(11-19JST) + EOD(0:00JST)
-triggers = { crons = ["0 20 * * *", "0 0 * * *", "10,20,30,40,50 0 * * *", "0 1 * * *", "0,15 * * * *"] }
+# Cloudflare アカウントを tomoya.kotetsu に固定する。
+# 別アカウントで `wrangler login` していると deploy がエラーになり、誤デプロイを防げる。
+account_id = "43ac0fa6a0cf47be7839e6178a2588d0"
+
+# Cron Triggers (UTC)。Cloudflare Free プランは「展開後」5 個までが上限。
+# 例: "10,20,30,40,50 0 * * *" は 5 トリガーとして数えられる点に注意。
+# 現在は 08:00 JST と 08:30 JST(タスクリマインド) の 2 個。定期通知(担当者通知/PMレポート/
+# リマインド)をフル稼働させる場合は cron を展開後 5 個以内に収めて追加すること。
+# "30 23 * * *" = 08:30 JST タスクリマインド(runTaskReminderFlow)
+triggers = { crons = ["0 23 * * *", "30 23 * * *"] }
 
 [observability]
 enabled = true
 
-# Replace with your KV namespace IDs.
+# 本番 KV namespace (NOTIFY_CACHE_DEV)。本番運用データはここに入っている。
 [[kv_namespaces]]
 binding = "NOTIFY_CACHE"
-id = "0d755a2c50404149ad9c03c4d7d2fad5"
-preview_id = "0d755a2c50404149ad9c03c4d7d2fad5"
+id = "6e1d5ae41cec40189b2f653e8dcee0b3"
+preview_id = "6e1d5ae41cec40189b2f653e8dcee0b3"
 
 [vars]
 OPENAI_MODEL = "gpt-4.1-mini"
 NOTIFY_PROPERTIES = "[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"
-
-# --- dev 環境用の上書き例（任意） ---
-[env.dev]
-name = "notion-sprint-worker-dev"
-triggers = { crons = ["0 23 * * *"] } # 08:00 JST 相当
-[[env.dev.kv_namespaces]]
-binding = "NOTIFY_CACHE"
-id = "0d755a2c50404149ad9c03c4d7d2fad5"
-preview_id = "0d755a2c50404149ad9c03c4d7d2fad5"
-
-[env.dev.vars]
-OPENAI_MODEL = "gpt-4.1-mini"
-NOTIFY_PROPERTIES = "[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"
+TEAM_FILTER = "TeamK"
+DRY_RUN = "false"
+MEMBER_EXCLUDE = "中村"
+MEMBER_EXTRA = "{\"松田直樹\":\"Matsuda Naoki\"}"

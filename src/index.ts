@@ -19,6 +19,7 @@ import {
   summarizeTasks,
   fetchCurrentSprintTasksSummary,
   fetchSprintCapacity,
+  fetchTasksByDueRange,
   isCompletedStatus
 } from "./notionApi";
 import { handleSlackEvents } from "./slackEvents";
@@ -32,6 +33,7 @@ import {
 } from "./llmAnalyzer";
 import { chatPostMessage, conversationsOpen } from "./slackBot";
 import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
+import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName } from "./userCatalog";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -108,6 +110,63 @@ function formatShortDate(dateStr: string): string {
   return `${parseInt(parts[1])}/${parseInt(parts[2])}`;
 }
 
+// Known project abbreviation overrides (Japanese names etc. that can't be auto-abbreviated)
+const PROJECT_ABBREVIATION_OVERRIDES: ReadonlyMap<string, string> = new Map([
+  ["三井住友海上", "ms"],
+]);
+const projectAbbrCache = new Map<string, string>();
+function abbreviateProject(name: string): string {
+  if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
+  for (const [pattern, abbr] of PROJECT_ABBREVIATION_OVERRIDES) {
+    if (name === pattern || name.startsWith(pattern)) { projectAbbrCache.set(name, abbr); return abbr; }
+  }
+  if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
+  const uppers = name.match(/[A-Z]/g);
+  if (uppers && uppers.length >= 2) { const abbr = uppers.join(""); projectAbbrCache.set(name, abbr); return abbr; }
+  const words = name.split(/[\s\-_・]+/).filter(Boolean);
+  if (words.length >= 2) { const abbr = words.map((w) => w[0].toUpperCase()).join(""); projectAbbrCache.set(name, abbr); return abbr; }
+  const abbr = /^[a-zA-Z]/.test(name) ? name.slice(0, 1).toUpperCase() : name.slice(0, 1);
+  projectAbbrCache.set(name, abbr);
+  return abbr;
+}
+
+type TaskTableRow = { name: string; project: string; status: string; priority: string; sp: string; due: string };
+
+/** タスク配列を等幅コードブロックの表に整形する（タスク名/プロジェクト/ステータス/優先度/SP/期限）。 */
+function renderTaskTable(tasks: TaskTableRow[]): string {
+  const headers = ["タスク名", "プロジェクト", "ステータス", "優先度", "SP", "期限"];
+  const keys: (keyof TaskTableRow)[] = ["name", "project", "status", "priority", "sp", "due"];
+  const colWidths = keys.map((k, i) =>
+    Math.max(getDisplayWidth(headers[i]), ...tasks.map((t) => getDisplayWidth(t[k])))
+  );
+  const lines: string[] = ["```"];
+  lines.push(headers.map((h, i) => padEndCjk(h, colWidths[i])).join("  "));
+  lines.push(colWidths.map((w) => "-".repeat(w)).join("  "));
+  for (const task of tasks) {
+    lines.push(
+      keys
+        .map((k, i) => (i === keys.length - 1 ? task[k] : padEndCjk(task[k], colWidths[i])))
+        .join("  ")
+    );
+  }
+  lines.push("```");
+  return lines.join("\n");
+}
+
+/** Notion タスク1件を表示用の行に変換する。プロジェクトは専用カラムに表示する。 */
+function taskToTableRow(task: {
+  name: string; status?: string | null; priority?: string | null; sp?: number | null; due?: string | null; projectName?: string | null;
+}): TaskTableRow {
+  return {
+    name: task.name,
+    project: task.projectName ? abbreviateProject(task.projectName) : "-",
+    status: task.status ?? "-",
+    priority: task.priority ?? "-",
+    sp: task.sp != null ? String(task.sp) : "-",
+    due: task.due ? formatShortDate(task.due) : "-"
+  };
+}
+
 function formatDeadlineTasksTable(
   summary: SprintTasksSummary,
   today: string,
@@ -119,33 +178,6 @@ function formatDeadlineTasksTable(
     string,
     Array<{ name: string; status: string; priority: string; sp: string; due: string }>
   >();
-
-  // Known project abbreviation overrides (Japanese names etc. that can't be auto-abbreviated)
-  const PROJECT_ABBREVIATION_OVERRIDES: ReadonlyMap<string, string> = new Map([
-    ["三井住友海上", "ms"],
-  ]);
-
-  // Build project abbreviation cache
-  const projectAbbrCache = new Map<string, string>();
-  const abbreviateProject = (name: string): string => {
-    if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
-    // Check explicit overrides first
-    for (const [pattern, abbr] of PROJECT_ABBREVIATION_OVERRIDES) {
-      if (name === pattern || name.startsWith(pattern)) { projectAbbrCache.set(name, abbr); return abbr; }
-    }
-    // Short names (<=3 chars): use as-is
-    if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
-    // Extract uppercase letters from camelCase/PascalCase
-    const uppers = name.match(/[A-Z]/g);
-    if (uppers && uppers.length >= 2) { const abbr = uppers.join(""); projectAbbrCache.set(name, abbr); return abbr; }
-    // Multi-word: initials
-    const words = name.split(/[\s\-_・]+/).filter(Boolean);
-    if (words.length >= 2) { const abbr = words.map((w) => w[0].toUpperCase()).join(""); projectAbbrCache.set(name, abbr); return abbr; }
-    // Single word: first char uppercase
-    const abbr = /^[a-zA-Z]/.test(name) ? name.slice(0, 1).toUpperCase() : name.slice(0, 1);
-    projectAbbrCache.set(name, abbr);
-    return abbr;
-  };
 
   for (const assignee of summary.assignees) {
     for (const task of assignee.tasks) {
@@ -209,6 +241,70 @@ function formatDeadlineTasksTable(
   }
 
   return sections.join("\n\n");
+}
+
+/**
+ * 【スケジュール分析】セクションをコードで生成する（固定フォーマット）。
+ * スプリント消化率・残り日数・必要SP/日・平均消化SP から オンスケ/注意/危険 を判定。
+ */
+function buildScheduleAnalysis(
+  summary: SprintTasksSummary,
+  avgDailySp: number | null,
+  today: string
+): string {
+  const m = summary.sprint_metrics;
+  const planSp = m?.plan_sp ?? null;
+  const progressSp = m?.progress_sp ?? null;
+  const remainingSp = planSp != null && progressSp != null ? planSp - progressSp : null;
+
+  const todayDate = new Date(today + "T00:00:00Z");
+  const endDate = new Date(summary.sprint.end_date + "T00:00:00Z");
+  const remainingDays = Math.max(
+    1,
+    Math.ceil((endDate.getTime() - todayDate.getTime()) / 86400000)
+  );
+  const requiredPerDay = m?.required_sp_per_day ??
+    (remainingSp != null ? Math.round((remainingSp / remainingDays) * 100) / 100 : null);
+
+  // 判定: 残りSP/残り日数 と 平均消化SP の比較
+  let verdict = "—";
+  if (remainingSp != null && avgDailySp != null && avgDailySp > 0) {
+    const needPerDay = remainingSp / remainingDays;
+    if (needPerDay <= avgDailySp) verdict = "🟢 オンスケ";
+    else if (remainingDays <= 2) verdict = "🔴 危険（期限直前で間に合わないペース）";
+    else verdict = "🟡 注意（今のペースだと間に合わない）";
+  }
+
+  const fmt = (v: number | null): string => (v == null ? "-" : String(v));
+  const body = [
+    `・スプリント: ${summary.sprint.name}（${summary.sprint.start_date} ～ ${summary.sprint.end_date}）`,
+    `・計画SP: ${fmt(planSp)} / 進捗SP: ${fmt(progressSp)} / 残りSP: ${fmt(remainingSp)}`,
+    `・残り日数: ${remainingDays} 日`,
+    `・必要SP/日: ${fmt(requiredPerDay)} SP/日`,
+    `・過去7日平均消化SP: ${avgDailySp != null ? avgDailySp.toFixed(1) : "-"} SP/日`,
+    `・判定: ${verdict}`
+  ].join("\n");
+  return "【スケジュール分析】\n```\n" + body + "\n```";
+}
+
+/**
+ * 担当者ごとのタスクテーブルを返す。期限による絞り込みは呼び出し側(fetchTasksByDueRange)で
+ * 済んでいる前提で、ここでは未完了タスクのみをテーブル化する。
+ * 1人1メッセージで個別送信するため、{担当者名, テーブル文字列} の配列で返す。
+ */
+function buildPerMemberTaskTables(
+  assignees: SprintTasksSummary["assignees"]
+): Array<{ assigneeName: string; tableText: string }> {
+  const result: Array<{ assigneeName: string; tableText: string }> = [];
+  for (const assignee of assignees) {
+    if (assignee.name === "未割当") continue; // 担当者なしのタスクはリマインド対象外
+    const rows = assignee.tasks
+      .filter((t) => !isCompletedStatus(t.status))
+      .map((t) => taskToTableRow(t));
+    if (rows.length === 0) continue;
+    result.push({ assigneeName: assignee.name, tableText: renderTaskTable(rows) });
+  }
+  return result;
 }
 
 const jsonResponse = (data: unknown, status = 200): Response =>
@@ -911,6 +1007,106 @@ async function runMorningFlow(
   }
 }
 
+/**
+ * タスクリマインド: 毎日 08:30 JST。SLACK_PMO_CHANNEL_ID に投稿する。
+ *  1. 親メッセージ "MM/DD_タスク"
+ *  2. スレッド内に【スケジュール分析】
+ *  3. スレッド内に未完了タスクがあるメンバーを1人1メッセージで（個別メンション）全件表示
+ */
+async function runTaskReminderFlow(
+  env: Env,
+  reason: string,
+  channelId?: string
+): Promise<Record<string, unknown>> {
+  let config: AppConfig | undefined;
+  try {
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
+    const channel = channelId ?? config.slackPmoChannelId ?? "";
+    if (!config.slackBotToken) {
+      console.warn("SLACK_BOT_TOKEN not set; skipping task reminder");
+      return { ok: true, skipped: true, reason: "no bot token" };
+    }
+    if (!channel) {
+      console.warn("SLACK_PMO_CHANNEL_ID not set; skipping task reminder");
+      return { ok: true, skipped: true, reason: "no channel" };
+    }
+
+    const now = new Date();
+    const today = toJstDateString(now);
+    const dateLabel = today.slice(5).replace("-", "/"); // "MM/DD"
+    const dueStart = toJstDateString(now, -3); // 今日-3日
+    const dueEnd = toJstDateString(now, 10);   // 今日+10日
+
+    // スケジュール分析はスプリントベース（現状のスプリント検出）
+    const summary = await fetchCurrentSprintTasksSummary(config, now);
+    const members = await fetchMembers(config).catch(() => []);
+
+    // 平均日次消化SP（KV 7日履歴 → スプリント計算 フォールバック）
+    const spConsumption = await calculateAvgDailySpConsumption(
+      env.NOTIFY_CACHE,
+      summary.sprint.id,
+      today
+    ).catch(() => null);
+    let avgDailySp: number | null = spConsumption ? spConsumption.avgDailySp : null;
+    if (avgDailySp == null) avgDailySp = calcAvgDailySpFromSprint(summary, today);
+
+    // 各自のタスクはスプリント非依存: 期限が今日-3日〜今日+10日の未完了タスクを直接取得
+    const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd);
+    const memberTables = buildPerMemberTaskTables(dueRange.assignees);
+
+    // メンション解決用: キャッシュ済みユーザーカタログ（別名で漢字/ローマ字の表記揺れを吸収）
+    const userCatalog = await ensureUserCatalog(env, config).catch(() => []);
+
+    if (config.dryRun) {
+      console.log(`DRY_RUN: task reminder — header="${dateLabel}_タスク", schedule + ${memberTables.length} members`);
+      return { ok: true, dryRun: true, members: memberTables.length };
+    }
+
+    // 1. 親メッセージ
+    const parent = await chatPostMessage(config.slackBotToken, channel, `${dateLabel}_タスク`);
+    const threadTs = parent.ts;
+
+    // 2. スケジュール分析（スレッド内）
+    await chatPostMessage(
+      config.slackBotToken,
+      channel,
+      buildScheduleAnalysis(summary, avgDailySp, today),
+      undefined,
+      threadTs
+    );
+
+    // 3. 各自のタスク状況（スレッド内・1人1メッセージ・個別メンション）
+    let sent = 0;
+    for (const { assigneeName, tableText } of memberTables) {
+      // カタログの別名照合でSlack IDを引く（"Matsuda Naoki"↔"松田" 等の表記揺れに対応）。
+      // 取れなければ従来のメンバー名部分一致でフォールバック。
+      const slackId =
+        resolveSlackUserIdByName(userCatalog, assigneeName) ??
+        members.find(
+          (m) => m.name === assigneeName || assigneeName.includes(m.name) || m.name.includes(assigneeName)
+        )?.slackUserId;
+      if (!slackId) console.warn(`Task reminder: no Slack ID for assignee "${assigneeName}"`);
+      const mention = slackId ? `<@${slackId}> ` : "";
+      await chatPostMessage(
+        config.slackBotToken,
+        channel,
+        `${mention}${assigneeName}\n${tableText}`,
+        undefined,
+        threadTs
+      );
+      sent++;
+    }
+
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "task-reminder");
+    console.log("Task reminder complete", { reason, members: sent });
+    return { ok: true, reason, members: sent, threadTs };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runTaskReminderFlow failed", err);
+    return { ok: false, error: err.message };
+  }
+}
+
 /** Reminder flow: 09:00 JST = 00:00 UTC */
 async function runReminderFlow(
   env: Env,
@@ -1160,19 +1356,10 @@ async function runEveningFlow(
       allocations: proposal.task_allocations.length
     });
 
-    // Build deadline tasks table programmatically and inject into pm_report
+    // Build deadline tasks table programmatically and append to pm_report
+    // (【メンバー稼働余力】は廃止したのでスケジュール分析の後ろに付ける)
     const deadlineTable = formatDeadlineTasksTable(summary, today);
-    let pmReport = proposal.pm_report;
-    const memberCapacityIdx = pmReport.indexOf("【メンバー稼働余力】");
-    if (memberCapacityIdx >= 0) {
-      pmReport =
-        pmReport.slice(0, memberCapacityIdx) +
-        deadlineTable +
-        "\n\n" +
-        pmReport.slice(memberCapacityIdx);
-    } else {
-      pmReport += "\n\n" + deadlineTable;
-    }
+    const pmReport = proposal.pm_report + "\n\n" + deadlineTable;
 
     // Step 7: Send PM daily report to PMO channel (mention PM)
     const channel = targetChannel ?? "";
@@ -1493,7 +1680,7 @@ async function runCronHealthCheck(env: Env): Promise<void> {
       dmChannelId,
       `⚠️ *cron 未実行アラート*\n` +
       `\`${rule.name}\` が本日 ${rule.expectedJst} JST に実行されていません。\n` +
-      `手動実行: \`curl https://notion-sprint-worker.kaede-pmo.workers.dev${rule.manualEndpoint}\``
+      `手動実行: \`curl https://notion-sprint-worker-dev.tomoya-kotetsu.workers.dev${rule.manualEndpoint}\``
     );
 
     await markCronAlertSent(env.NOTIFY_CACHE, rule.name, today);
@@ -1706,6 +1893,38 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
+  if (path === "/pmo/task-reminder") {
+    // ?debug=1 → Slackには投稿せず、today・期限window・対象タスク（スプリント非依存）を返す
+    if (url.searchParams.get("debug")) {
+      const config = getConfig(env);
+      const now = new Date();
+      const today = toJstDateString(now);
+      const dueStart = toJstDateString(now, -3);
+      const dueEnd = toJstDateString(now, 10);
+      const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd);
+      const userCatalog = await ensureUserCatalog(env, config).catch(() => []);
+      const members = await fetchMembers(config).catch(() => []);
+      const assignees = dueRange.assignees
+        .filter((a) => a.name !== "未割当")
+        .map((a) => {
+          const catalogSlackId = resolveSlackUserIdByName(userCatalog, a.name) ?? null;
+          const legacySlackId = members.find(
+            (m) => m.name === a.name || a.name.includes(m.name) || m.name.includes(a.name)
+          )?.slackUserId ?? null;
+          return {
+            name: a.name,
+            mentionResolved: !!catalogSlackId,
+            catalogSlackId,
+            legacySlackId,
+            taskCount: a.tasks.filter((t) => !isCompletedStatus(t.status)).length
+          };
+        });
+      return jsonResponse({ today, nowUtc: now.toISOString(), dueWindow: { start: dueStart, end: dueEnd }, assignees });
+    }
+    const result = await runTaskReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
   if (path === "/pmo/reminder") {
     const result = await runReminderFlow(env, "manual");
     return jsonResponse(result, result.ok ? 200 : 500);
@@ -1745,6 +1964,17 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     const config = getConfig(env);
     const projects = await getCachedProjects(env.NOTIFY_CACHE, config.teamFilter);
     return jsonResponse({ ok: true, teamFilter: config.teamFilter, count: projects.length, projects });
+  }
+
+  if (path === "/pmo/refresh-users") {
+    const result = await refreshUserCatalog(env);
+    return jsonResponse({ ok: true, ...result });
+  }
+
+  if (path === "/pmo/users") {
+    const config = getConfig(env);
+    const users = await getCachedUsers(env.NOTIFY_CACHE, config.teamFilter);
+    return jsonResponse({ ok: true, teamFilter: config.teamFilter, count: users.length, users });
   }
 
   if (path === "/query" && request.method === "POST") {
@@ -1911,9 +2141,13 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Branch by cron expression
     if (event.cron === "0 20 * * *") {
-      // 05:00 JST — Save progress SP snapshot + refresh project catalog
+      // 05:00 JST — Save progress SP snapshot + refresh project & user catalogs
       ctx.waitUntil(runProgressSpSnapshot(env, "cron"));
       ctx.waitUntil(refreshProjectCatalog(env));
+      ctx.waitUntil(refreshUserCatalog(env));
+    } else if (event.cron === "30 23 * * *") {
+      // 08:30 JST — Task reminder (per-member task status posted in a thread)
+      ctx.waitUntil(runTaskReminderFlow(env, "cron"));
     } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runForAllChannels(env, (ch) => runMorningFlow(env, "cron", null, ch)));

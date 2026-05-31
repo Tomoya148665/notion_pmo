@@ -23,6 +23,8 @@ export interface Bindings {
   MEMBER_DB_URL?: string;
   MEMBER_SLACK_MAP?: string;
   MEMBER_WHITELIST?: string;
+  MEMBER_EXCLUDE?: string;
+  MEMBER_EXTRA?: string;
   GITHUB_TOKEN?: string;
   GOOGLE_SHEETS_ID?: string;
   GOOGLE_SHEETS_API_KEY?: string;
@@ -60,6 +62,8 @@ export interface AppConfig {
   memberDbId?: string;
   memberSlackMap: Record<string, string>;
   memberWhitelist: string[];
+  memberExclude: string[];
+  memberExtra: Record<string, string>;
   googleSheetsId?: string;
   googleSheetsApiKey?: string;
   googleSheetsRange?: string;
@@ -125,6 +129,17 @@ const parseMemberSlackMap = (value?: string): Record<string, string> => {
   return {};
 };
 
+const parseMemberExtra = (value?: string): Record<string, string> => {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+  } catch { /* ignore */ }
+  return {};
+};
+
 export function getConfig(env: Bindings): AppConfig {
   if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required");
   if (!env.NOTION_OAUTH_ACCESS_TOKEN)
@@ -161,6 +176,8 @@ export function getConfig(env: Bindings): AppConfig {
     memberDbId,
     memberSlackMap: parseMemberSlackMap(env.MEMBER_SLACK_MAP),
     memberWhitelist: parseList(env.MEMBER_WHITELIST, []),
+    memberExclude: parseList(env.MEMBER_EXCLUDE, []),
+    memberExtra: parseMemberExtra(env.MEMBER_EXTRA),
     googleSheetsId: env.GOOGLE_SHEETS_ID,
     googleSheetsApiKey: env.GOOGLE_SHEETS_API_KEY,
     googleSheetsRange: env.GOOGLE_SHEETS_RANGE,

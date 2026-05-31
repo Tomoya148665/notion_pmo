@@ -21,6 +21,7 @@ import {
   executeTaskCreation,
   sendCompletionNotification
 } from "./slackEvents";
+import { ensureUserCatalog, makeAssigneeResolver, type AssigneeResolver } from "./userCatalog";
 import { interpretPmReply } from "./llmAnalyzer";
 import { fetchNotionUserMap, buildUserMapFromDatabase, appendPageContent, appendLinksToPage } from "./notionWriter";
 import type { AllocationProposal, NewTask } from "./schema";
@@ -301,21 +302,13 @@ export async function handleSlackInteractions(
     return new Response("ok");
   }
 
-  // Use TransformStream to keep Worker alive beyond 30s waitUntil limit
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const task = (async () => {
-    try {
-      await handler;
-    } catch (err) {
-      console.error("interaction handler failed:", err);
-    } finally {
-      await writer.write(new TextEncoder().encode("ok"));
-      await writer.close();
-    }
-  })();
+  // Respond to Slack immediately (must ack within 3s or user sees timeout error).
+  // The actual work runs in ctx.waitUntil and updates the original message via chatUpdate when done.
+  const task = handler.catch((err) => {
+    console.error("interaction handler failed:", err);
+  });
   if (ctx) ctx.waitUntil(task);
-  return new Response(readable, { status: 200 });
+  return new Response("");
 }
 
 // ── Task/Update approval button handler ────────────────────────────────────
@@ -364,6 +357,20 @@ async function handleTaskActionButton(
     return;
   }
 
+  // Approved: まず即座にボタンを消して「処理中」を表示する。
+  // この後の Notion 処理は数秒かかるため、押した人へのフィードバックと
+  // 二重クリックによる重複起票の防止を兼ねる。完了後に下の chatUpdate が結果で上書きする。
+  await chatUpdate(
+    config.slackBotToken,
+    channel,
+    messageTs,
+    originalText + "\n\n⏳ 処理中です…",
+    [
+      ...blocksWithoutActions,
+      textSection(`⏳ <@${userId}> が承認しました — 処理中です…`)
+    ]
+  );
+
   // Approved: execute actions
   const createActions = pending.actions.filter((a) => a.action === "create_task");
 
@@ -374,6 +381,9 @@ async function handleTaskActionButton(
       : new Map<string, string>();
     const notionUserMap = await fetchNotionUserMap(config.notionToken);
     const userMaps = { dbUserMap, notionUserMap };
+
+    // Assignee resolver from the cached user catalog (no live Slack/Notion user crawl)
+    const resolveAssignee = makeAssigneeResolver(await ensureUserCatalog(env, config));
 
     const taskResults = await Promise.all(
       createActions.map(async (createAction) => {
@@ -389,10 +399,13 @@ async function handleTaskActionButton(
             notionToken: config.notionToken,
             taskDbId: config.taskDbId,
             taskSprintRelationProperty: config.taskSprintRelationProperty,
-            dryRun: config.dryRun
+            dryRun: config.dryRun,
+            memberExclude: config.memberExclude,
+            memberExtra: config.memberExtra
           },
           newTask,
-          userMaps
+          userMaps,
+          resolveAssignee
         );
 
         if (result.pageId && newTask.description) {
@@ -446,12 +459,19 @@ async function handleTaskActionButton(
       await sendCompletionNotification(config.slackBotToken, pmoChannel, notificationLines, false);
     }
   } else {
-    // Update actions (update_due, update_sp, update_status, etc.)
+    // Update actions (update_due, update_sp, update_status, update_assignee, etc.)
+    // Build assignee resolver only when an assignee change is present (avoids extra API calls)
+    let resolveAssignee: AssigneeResolver | undefined;
+    if (pending.actions.some((a) => a.action === "update_assignee")) {
+      resolveAssignee = makeAssigneeResolver(await ensureUserCatalog(env, config));
+    }
+
     const results = await executeNotionActions(
       config.notionToken,
       pending.actions,
       config.dryRun,
-      config.projectDbId
+      config.projectDbId,
+      resolveAssignee
     );
 
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
@@ -581,11 +601,15 @@ async function handlePmReportButton(
   const approvalText = "全提案を承認します";
   const actions = await interpretPmReply(config, proposal, approvalText);
 
+  // PM report approvals reassign owners — resolver from the cached user catalog
+  const pmResolveAssignee = makeAssigneeResolver(await ensureUserCatalog(env, config));
+
   const results = await executeNotionActions(
     config.notionToken,
     actions.actions,
     config.dryRun,
-    config.projectDbId
+    config.projectDbId,
+    pmResolveAssignee
   );
 
   const summaryMsg = results.length > 0

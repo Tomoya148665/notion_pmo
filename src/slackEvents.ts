@@ -23,10 +23,11 @@ import {
   deletePhoneReminder
 } from "./workflow";
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen, conversationsInfo, usersInfo } from "./slackBot";
-import { ensureProjectCatalog, resolveProjectFromCache } from "./projectCatalog";
+import { ensureProjectCatalog, resolveProjectFromCache, resolveProjectByChannelName, topProjectCandidates, extractProjectFromText, type CachedProject } from "./projectCatalog";
+import { ensureUserCatalog, makeAssigneeResolver, resolveMemberBySlackId, extractAssigneesFromText, type AssigneeResolver, type CachedUser } from "./userCatalog";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
-import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchPageTitles } from "./notionApi";
+import { fetchCurrentSprintTasksSummary, fetchCurrentSprintInfo, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems } from "./notionApi";
 import { fetchMembers } from "./memberApi";
 import {
   calculateAvgDailySpConsumption,
@@ -67,6 +68,28 @@ async function verifySlackSignature(
   return computed === signature;
 }
 
+// ── Intent pre-detection (rule-based, no LLM) ─────────────────────────────────
+
+/**
+ * 単純なルールベースでメンションの意図を推定する。
+ * "create" を返した場合、起票専用の軽量パスを使って fetch とプロンプトを削減する。
+ * 確信が持てない場合は "other" を返す (= 既存のフル context フロー)。
+ */
+function detectIntentHint(text: string): "create" | "other" {
+  const t = text.trim();
+  if (!t) return "other";
+  if (/起票/.test(t)) return "create";
+  if (/タスク[をに]?(?:追加|作成|登録|作って|新規)/u.test(t)) return "create";
+  // "Xを松田君に追加" の様な末尾パターン
+  if (/に追加(?:して|お願い|します)?[!！。.]*$/u.test(t)) return "create";
+  if (/(?:作って|追加して|登録して)(?:[くだ]さい)?[!！。.]*$/u.test(t)) return "create";
+  return "other";
+}
+
+// ── Assignee name resolver ───────────────────────────────────────────────
+// 担当者解決ロジックは src/userCatalog.ts に移動（KVキャッシュ化）。
+// AssigneeResolver / makeAssigneeResolver / resolveMemberBySlackId を import して使う。
+
 // ── Execute a Notion task creation ──────────────────────────────────────────
 
 export async function executeTaskCreation(
@@ -75,24 +98,58 @@ export async function executeTaskCreation(
     taskDbId?: string;
     taskSprintRelationProperty: string;
     dryRun: boolean;
+    memberExclude?: string[];
+    memberExtra?: Record<string, string>;
   },
   task: NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null },
-  userMaps?: { dbUserMap: Map<string, string>; notionUserMap: Map<string, string> }
+  userMaps?: { dbUserMap: Map<string, string>; notionUserMap: Map<string, string> },
+  resolveAssignee?: AssigneeResolver
 ): Promise<{ message: string; pageId?: string }> {
   if (!config.taskDbId) {
     return { message: "❌ TASK_DB_URL が未設定のためタスクを作成できません" };
   }
 
+  // 担当者から除外する名前(部分一致)。チーム外のコラボレーター等を割り当て対象から外す。
+  const excludeList = config.memberExclude ?? [];
+  const isExcluded = (notionName: string): boolean =>
+    excludeList.some((ex) => notionName.includes(ex) || ex.includes(notionName));
+
+  // 表示名 → Notion 上の正式名へのエイリアス (例: 松田直樹 → Matsuda Naoki)
+  const memberExtra = config.memberExtra ?? {};
+
+  // Strip Japanese honorifics so "松田君" / "古鉄さん" etc. resolve like the bare name
+  const stripHonorific = (name: string): string =>
+    name.replace(/(さん|くん|ちゃん|様|さま|殿|氏|君)$/u, "").trim();
+
   // Resolve assignee name → Notion user ID
   // Try exact match first, then partial match (e.g. "北川" matches "北川楓")
-  const findUser = (map: Map<string, string>, name: string): string | undefined => {
-    // Exact match
+  const findUser = (map: Map<string, string>, rawName: string): string | undefined => {
+    const name = stripHonorific(rawName);
+    // Alias check: if input name has an alias, resolve via that alias name
+    const aliased = memberExtra[name];
+    if (aliased) {
+      const aliasId = map.get(aliased);
+      if (aliasId && !isExcluded(aliased)) {
+        console.log(`Assignee alias: "${rawName}" → "${aliased}" (${aliasId})`);
+        return aliasId;
+      }
+      // Try partial match on aliased name
+      for (const [notionName, id] of map) {
+        if (isExcluded(notionName)) continue;
+        if (notionName.includes(aliased) || aliased.includes(notionName)) {
+          console.log(`Assignee alias+partial: "${rawName}" → "${aliased}" → "${notionName}" (${id})`);
+          return id;
+        }
+      }
+    }
+    // Exact match (must not be excluded)
     const exact = map.get(name);
-    if (exact) return exact;
+    if (exact && !isExcluded(name)) return exact;
     // Partial match: input is substring of Notion name, or vice versa
     for (const [notionName, id] of map) {
+      if (isExcluded(notionName)) continue;
       if (notionName.includes(name) || name.includes(notionName)) {
-        console.log(`Assignee partial match: "${name}" → "${notionName}" (${id})`);
+        console.log(`Assignee partial match: "${rawName}" → "${notionName}" (${id})`);
         return id;
       }
     }
@@ -100,16 +157,39 @@ export async function executeTaskCreation(
   };
 
   let assigneeId: string | undefined;
-  const dbMap = userMaps?.dbUserMap ?? (config.taskDbId ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId) : new Map<string, string>());
-  assigneeId = findUser(dbMap, task.assignee);
+  // Primary: pre-built member alias resolver (handles kanji/hiragana/romaji variations)
+  if (resolveAssignee) {
+    assigneeId = resolveAssignee(task.assignee);
+    console.log(`Assignee via resolver: "${task.assignee}" → ${assigneeId ?? "(not found)"}`);
+  }
+  // Fallback: legacy findUser against Notion task DB + workspace users (for non-member names)
   if (!assigneeId) {
-    const notionMap = userMaps?.notionUserMap ?? await fetchNotionUserMap(config.notionToken);
-    assigneeId = findUser(notionMap, task.assignee);
+    const dbMap = userMaps?.dbUserMap ?? (config.taskDbId ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId) : new Map<string, string>());
+    assigneeId = findUser(dbMap, task.assignee);
+    if (!assigneeId) {
+      const notionMap = userMaps?.notionUserMap ?? await fetchNotionUserMap(config.notionToken);
+      assigneeId = findUser(notionMap, task.assignee);
+    }
+  }
+
+  // ── Due date safety net: if LLM returned a past date, override with SP-based default ──
+  const todayJst = toJstDateString(new Date());
+  let finalDue = task.due;
+  if (finalDue && finalDue < todayJst) {
+    const addDays = (n: number): string => {
+      const d = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().slice(0, 10);
+    };
+    const sp = task.sp ?? 3;
+    const offset = sp <= 3 ? 2 : sp <= 5 ? 3 : sp <= 8 ? 4 : 5;
+    finalDue = addDays(offset);
+    console.warn(`Due overridden: LLM returned past date "${task.due}" (today=${todayJst}); using SP-based default "${finalDue}" (sp=${sp})`);
   }
 
   const properties: Record<string, unknown> = {
     名前: { title: [{ text: { content: task.task_name } }] },
-    期限: { date: { start: task.due } },
+    期限: { date: { start: finalDue } },
     SP: { number: task.sp },
     ステータス: { status: { name: task.status } },
     カテゴリ: { select: { name: "タスク" } }
@@ -161,45 +241,33 @@ export async function executeTaskCreation(
     : task.task_name;
 
   return {
-    message: `✅ タスク作成完了\n・タスク名: ${taskLink}\n・担当: ${assigneeNote}\n・期限: ${task.due}\n・SP: ${task.sp}`,
+    message: `✅ タスク作成完了\n・タスク名: ${taskLink}\n・担当: ${assigneeNote}\n・期限: ${finalDue}\n・SP: ${task.sp}`,
     pageId: createdPage?.id
   };
 }
 
-// ── Fetch related messages from channel for task description ─────────────
+// ── Fetch recent top-level channel messages (thread replies excluded) ────
+// チャンネルに直接メンションされたとき用。直近 N 件のトップレベルメッセージ
+// のみを返し、各メッセージにぶら下がるスレッド返信の中身は取得しない。
+// （conversations.history は元々スレッド返信を含まず、親メッセージのみを返す）
 
 async function fetchChannelContext(
   token: string,
-  channel: string
+  channel: string,
+  limit = 15
 ): Promise<Array<{ text: string; user: string; ts: string }>> {
   try {
-    const messages = await conversationsHistory(token, channel, 50);
+    const messages = await conversationsHistory(token, channel, limit);
     console.log(`fetchChannelContext: got ${messages.length} messages from channel`);
 
     const result: Array<{ text: string; user: string; ts: string }> = [];
-    let threadsFetched = 0;
-
     for (const msg of messages) {
       if (!msg.text) continue;
       result.push({ text: msg.text, user: msg.user, ts: msg.ts });
-
-      // Fetch thread replies for threaded messages (max 5 threads)
-      if (msg.reply_count && msg.reply_count > 0 && threadsFetched < 5) {
-        try {
-          const threadTs = msg.thread_ts ?? msg.ts;
-          const replies = await conversationsReplies(token, channel, threadTs, 10);
-          for (const reply of replies) {
-            result.push({ text: reply.text, user: reply.user, ts: reply.ts });
-          }
-          threadsFetched++;
-        } catch (err) {
-          console.warn(`fetchChannelContext: thread ${msg.ts} replies failed: ${(err as Error).message}`);
-        }
-      }
     }
 
-    console.log(`fetchChannelContext: ${result.length} total messages (including threads)`);
-    return result.slice(0, 50);
+    console.log(`fetchChannelContext: ${result.length} recent channel messages (no thread replies)`);
+    return result.slice(0, limit);
   } catch (err) {
     console.warn(`fetchChannelContext error: ${(err as Error).message}`);
     return [];
@@ -245,7 +313,8 @@ export async function executeNotionActions(
     new_value: string;
   }>,
   dryRun: boolean,
-  projectDbId?: string
+  projectDbId?: string,
+  resolveAssignee?: AssigneeResolver
 ): Promise<string[]> {
   const results: string[] = [];
 
@@ -268,9 +337,13 @@ export async function executeNotionActions(
         continue;
       }
       try {
-        await updateTaskPage(token, action.page_id, { assignee: action.new_value });
+        // Resolve assignee name → Notion user ID using the member resolver
+        // (handles kanji/hiragana/romaji/honorific variations like "古鉄" → "古鉄朋也 / Tomoya Kotetsu")
+        const resolvedId = resolveAssignee ? resolveAssignee(action.new_value) : undefined;
+        await updateTaskPage(token, action.page_id, { assignee: action.new_value, assigneeId: resolvedId });
         const link = notionPageUrl(action.page_id);
-        results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${action.new_value}`);
+        const note = resolvedId ? "" : "（⚠️ Notion ユーザー未検出のため未設定）";
+        results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${action.new_value}${note}`);
       } catch (err) {
         console.error(`Failed to update assignee for ${action.page_id}`, (err as Error).message);
         results.push(`・${action.task_name}: 担当者変更失敗 (${(err as Error).message})`);
@@ -517,11 +590,75 @@ async function handleProjectSelectionReply(
   return true;
 }
 
+// ── Deterministic project / assignee resolution helpers ────────────────────
+
+interface ProjectResolution {
+  resolvedProjectIds: string[];
+  projectDisplay: string | null;
+  /** カタログに当てはまらず聞き返しが必要な場合の候補とクエリ */
+  selection?: { candidates: Array<{ id: string; name: string }>; query: string };
+}
+
+/**
+ * 起票タスクのプロジェクトを決定的に解決する。
+ *  - project === ""     → プロジェクトなし
+ *  - project = 名前      → カタログ照合（ミスなら候補提示）
+ *  - project === null    → チャンネル名からカタログ照合（ミスなら候補提示）
+ * スプリント多数決などのデフォルト補完は行わない。
+ */
+function resolveTaskProject(
+  projectVal: string | null | undefined,
+  channelName: string,
+  catalog: CachedProject[]
+): ProjectResolution {
+  if (projectVal === "") {
+    return { resolvedProjectIds: [], projectDisplay: null };
+  }
+  if (projectVal) {
+    const hit = resolveProjectFromCache(catalog, projectVal);
+    if (hit) return { resolvedProjectIds: [hit.id], projectDisplay: hit.name };
+    return {
+      resolvedProjectIds: [],
+      projectDisplay: null,
+      selection: { candidates: topProjectCandidates(catalog, projectVal), query: projectVal }
+    };
+  }
+  // null（明示なし）→ チャンネル名で推定
+  const hit = resolveProjectByChannelName(catalog, channelName);
+  if (hit) return { resolvedProjectIds: [hit.id], projectDisplay: hit.name };
+  return {
+    resolvedProjectIds: [],
+    projectDisplay: null,
+    selection: { candidates: topProjectCandidates(catalog, channelName), query: channelName }
+  };
+}
+
+/**
+ * 本文中の @メンション（Bot自身を除く）から担当者メンバー名を1件だけ特定する。
+ * 非Botメンションがちょうど1件で、それがカタログのメンバーに一致したときのみ返す。
+ */
+function extractMentionedMemberName(
+  rawText: string,
+  botUserId: string | undefined,
+  catalog: CachedUser[]
+): string | undefined {
+  const ids: string[] = [];
+  for (const m of rawText.matchAll(/<@([A-Z0-9]+)>/g)) {
+    if (botUserId && m[1] === botUserId) continue;
+    ids.push(m[1]);
+  }
+  if (ids.length !== 1) return undefined; // 0件 or 複数 → 上書きしない
+  return resolveMemberBySlackId(catalog, ids[0])?.name;
+}
+
+const SELF_REFERENCE_RE = /^(自分|私|わたし|俺|おれ|僕|ぼく|me)$/i;
+
 // ── Handle @mention (app_mention event) ───────────────────────────────────
 
 async function handleMention(
   env: Bindings,
-  event: Record<string, unknown>
+  event: Record<string, unknown>,
+  botUserId?: string
 ): Promise<void> {
   const channel = event.channel as string;
   const config = await resolveConfig(env, channel);
@@ -585,11 +722,22 @@ async function handleMention(
   try {
     const now = new Date();
     const today = toJstDateString(now);
+    const hasThread = !!event.thread_ts;
+    // Rule-based intent hint computed before any fetch so we can choose the light path
+    const intentHint = detectIntentHint(userText);
+    const skipForCreate = intentHint === "create";
+    // If the user mentions sprint explicitly, we still need the full sprint list for matching
+    const mentionsSprint = /スプリント|sprint|s\d+|バックログ|backlog/iu.test(userText);
+    if (skipForCreate) {
+      console.log(`Intent hint: create — using light fetch path${mentionsSprint ? " (sprint mentioned, keeping allSprints)" : ""}`);
+    }
 
-    // Fetch current sprint tasks for LLM context
-    const summary = await fetchCurrentSprintTasksSummary(config, now);
+    // Fetch current sprint info — light version (no task list) for create-task fast path
+    const summary = skipForCreate
+      ? await fetchCurrentSprintInfo(config, now)
+      : await fetchCurrentSprintTasksSummary(config, now);
 
-    // Build current task snapshot for helper functions
+    // Build current task snapshot for helper functions (empty for create — those helpers are skipped anyway)
     const currentSnapshot = summary.assignees.flatMap((a) =>
       a.tasks.map((t) => ({
         id: t.id,
@@ -599,8 +747,6 @@ async function handleMention(
       }))
     );
 
-    // Fetch all context data in parallel (including thread/channel context and KV lookups)
-    const hasThread = !!event.thread_ts;
     const [
       members,
       capacities,
@@ -616,29 +762,36 @@ async function handleMention(
       conversationHistoryResult,
       pendingCreateRefResult,
       channelInfoResult,
-      cachedProjectsResult
+      cachedProjectsResult,
+      userCatalogResult
     ] = await Promise.all([
       fetchMembers(config).catch(() => []),
-      fetchSprintCapacity(config, summary.sprint.id).catch(() => []),
-      fetchScheduleData(config).catch(() => null),
-      calculateAvgDailySpConsumption(env.NOTIFY_CACHE, summary.sprint.id, today).catch(() => null),
-      calculateWeeklyDiff(env.NOTIFY_CACHE, summary.sprint.id, today, currentSnapshot).catch(() => null),
-      detectStagnantDoingTasks(env.NOTIFY_CACHE, summary.sprint.id, today, currentSnapshot).catch(() => []),
-      fetchAllSprints(config).catch(() => []),
-      hasThread ? Promise.resolve([]) : fetchReferenceDbItems(config).catch(() => []),
-      // Thread & channel context (parallelized with above)
+      skipForCreate ? Promise.resolve([]) : fetchSprintCapacity(config, summary.sprint.id).catch(() => []),
+      skipForCreate ? Promise.resolve(null) : fetchScheduleData(config).catch(() => null),
+      skipForCreate ? Promise.resolve(null) : calculateAvgDailySpConsumption(env.NOTIFY_CACHE, summary.sprint.id, today).catch(() => null),
+      skipForCreate ? Promise.resolve(null) : calculateWeeklyDiff(env.NOTIFY_CACHE, summary.sprint.id, today, currentSnapshot).catch(() => null),
+      skipForCreate ? Promise.resolve([]) : detectStagnantDoingTasks(env.NOTIFY_CACHE, summary.sprint.id, today, currentSnapshot).catch(() => []),
+      // Skip fetchAllSprints in create fast path unless user explicitly references a sprint
+      skipForCreate && !mentionsSprint
+        ? Promise.resolve([])
+        : fetchAllSprints(config).catch(() => []),
+      hasThread || skipForCreate ? Promise.resolve([]) : fetchReferenceDbItems(config).catch(() => []),
+      // Thread context: スレッド内メンション時はそのスレッドのみを見る
       hasThread
         ? conversationsReplies(config.slackBotToken, channel, threadTs, 30, true).catch(() => [] as Array<{ ts: string; text: string; user: string }>)
         : Promise.resolve([] as Array<{ ts: string; text: string; user: string }>),
+      // Channel context: チャンネル直接メンション時は直近15件を見る。
+      // create 時も「これ起票して」の『これ』が指す会話（内容・期限）を拾うために必要なので省略しない。
       hasThread
-        ? fetchChannelContext(config.slackBotToken, channel).catch(() => [] as Array<{ text: string; user: string; ts: string }>)
-        : Promise.resolve([] as Array<{ text: string; user: string; ts: string }>),
+        ? Promise.resolve([] as Array<{ text: string; user: string; ts: string }>)
+        : fetchChannelContext(config.slackBotToken, channel, 15).catch(() => [] as Array<{ text: string; user: string; ts: string }>),
       // KV lookups (parallelized with above)
       getThreadState(env.NOTIFY_CACHE, channel, threadTs).catch(() => null),
       getMentionHistory(env.NOTIFY_CACHE, channel, threadTs).catch(() => [] as Array<{ role: "user" | "assistant"; content: string }>),
       getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs).catch(() => null),
       conversationsInfo(config.slackBotToken, channel).catch(() => ({ name: "" })),
-      ensureProjectCatalog(env, config).catch(() => [])
+      ensureProjectCatalog(env, config).catch(() => []),
+      ensureUserCatalog(env, config).catch(() => [] as CachedUser[])
     ]);
 
     // Merge capacity data into members
@@ -650,27 +803,34 @@ async function handleMention(
     }
 
     // Calculate avg daily SP (priority: KV 7-day history > sprint-level)
-    let avgDailySp: number | null = spConsumption ? spConsumption.avgDailySp : null;
-    if (avgDailySp == null) {
-      avgDailySp = calcAvgDailySpFromSprint(summary, today);
-    }
+    // For create-task fast path, skip these computations entirely so they're omitted from the LLM prompt.
+    let avgDailySp: number | null = null;
+    let planSp: number | null = null;
+    let progressSp: number | null = null;
+    let requiredSpPerDay: number | null = null;
 
-    // Calculate sprint metrics
-    const planSp = typeof summary.sprint_metrics?.plan_sp === "number"
-      ? summary.sprint_metrics.plan_sp : null;
-    const progressSp = typeof summary.sprint_metrics?.progress_sp === "number"
-      ? summary.sprint_metrics.progress_sp : null;
+    if (!skipForCreate) {
+      avgDailySp = spConsumption ? spConsumption.avgDailySp : null;
+      if (avgDailySp == null) {
+        avgDailySp = calcAvgDailySpFromSprint(summary, today);
+      }
+      planSp = typeof summary.sprint_metrics?.plan_sp === "number"
+        ? summary.sprint_metrics.plan_sp : null;
+      progressSp = typeof summary.sprint_metrics?.progress_sp === "number"
+        ? summary.sprint_metrics.progress_sp : null;
+      const remainingSpLocal = planSp != null && progressSp != null ? planSp - progressSp : null;
+      const endDate = new Date(`${summary.sprint.end_date}T00:00:00Z`);
+      const startDate = new Date(`${summary.sprint.start_date}T00:00:00Z`);
+      const totalDays = Math.ceil((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
+      const elapsedDays = Math.ceil((now.getTime() - startDate.getTime()) / 86400000) + 1;
+      const remainingDays = totalDays > 0 ? Math.max(totalDays - elapsedDays, 1) : 1;
+      requiredSpPerDay = typeof summary.sprint_metrics?.required_sp_per_day === "number"
+        ? summary.sprint_metrics.required_sp_per_day
+        : remainingSpLocal != null
+          ? Math.round((remainingSpLocal / remainingDays) * 100) / 100
+          : null;
+    }
     const remainingSp = planSp != null && progressSp != null ? planSp - progressSp : null;
-    const endDate = new Date(`${summary.sprint.end_date}T00:00:00Z`);
-    const startDate = new Date(`${summary.sprint.start_date}T00:00:00Z`);
-    const totalDays = Math.ceil((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
-    const elapsedDays = Math.ceil((now.getTime() - startDate.getTime()) / 86400000) + 1;
-    const remainingDays = totalDays > 0 ? Math.max(totalDays - elapsedDays, 1) : 1;
-    const requiredSpPerDay = typeof summary.sprint_metrics?.required_sp_per_day === "number"
-      ? summary.sprint_metrics.required_sp_per_day
-      : remainingSp != null
-        ? Math.round((remainingSp / remainingDays) * 100) / 100
-        : null;
 
     // Build schedule deviation summary
     let scheduleDeviation: MentionContext["scheduleDeviation"] = null;
@@ -743,10 +903,8 @@ async function handleMention(
         start_date: s.start_date,
         end_date: s.end_date
       })),
-      ...(channelInfoResult.name ? { channelName: channelInfoResult.name } : {}),
-      ...(cachedProjectsResult.length > 0
-        ? { availableProjects: cachedProjectsResult.map((p) => ({ id: p.id, name: p.name })) }
-        : {})
+      ...(channelInfoResult.name ? { channelName: channelInfoResult.name } : {})
+      // availableProjects はLLMに注入しない: プロジェクト選択はコード側で決定的に行う
     };
 
     // Resolve Slack user ID → member name for "自分" resolution
@@ -799,24 +957,24 @@ async function handleMention(
     const resolveUserIdName = (uid: string): string =>
       slackIdToName.get(uid) ?? uid;
 
-    // Process thread/channel context from parallel fetch results
+    // Process thread/channel context from parallel fetch results.
+    // スレッド内メンション → threadContext のみ / チャンネル直接メンション → channelContext のみ
+    // （rawThreadMsgs と rawChannelMsgs は hasThread によって排他的に populate される）
     let threadContext: Array<{ text: string; user: string }> | undefined;
     let channelContext: Array<{ text: string; user: string }> | undefined;
-    if (hasThread) {
-      if (rawThreadMsgs.length > 0) {
-        threadContext = rawThreadMsgs.map((m) => ({
-          text: resolveSlackMentions(m.text),
-          user: resolveUserIdName(m.user)
-        }));
-        console.log(`Thread context: ${threadContext.length} messages from thread ${threadTs}`);
-      }
-      if (rawChannelMsgs.length > 0) {
-        channelContext = rawChannelMsgs.map((m) => ({
-          text: resolveSlackMentions(m.text),
-          user: resolveUserIdName(m.user)
-        }));
-        console.log(`Channel context: ${channelContext.length} messages for cross-reference`);
-      }
+    if (rawThreadMsgs.length > 0) {
+      threadContext = rawThreadMsgs.map((m) => ({
+        text: resolveSlackMentions(m.text),
+        user: resolveUserIdName(m.user)
+      }));
+      console.log(`Thread context: ${threadContext.length} messages from thread ${threadTs}`);
+    }
+    if (rawChannelMsgs.length > 0) {
+      channelContext = rawChannelMsgs.map((m) => ({
+        text: resolveSlackMentions(m.text),
+        user: resolveUserIdName(m.user)
+      }));
+      console.log(`Channel context: ${channelContext.length} recent channel messages`);
     }
 
     // Process thread state from parallel fetch result
@@ -930,6 +1088,34 @@ async function handleMention(
         console.log(`Cleaned up old pending create: confirmMsgTs=${pendingCreateRef.confirmMsgTs}`);
       }
 
+      // ── 担当者を決定的に特定（ルール優先・曖昧時のみLLM） ───────────────
+      // 優先順: ①本文の@メンション(Bot除く) ②本文走査でちょうど1人一致 ③「自分」=発言者
+      // ①②③のいずれにも当たらなければ LLM 抽出の assignee をそのまま使う（フォールバック）。
+      const assigneeResolver = makeAssigneeResolver(userCatalogResult);
+      const mentionedName = extractMentionedMemberName(rawText, botUserId, userCatalogResult);
+      const textAssignees = extractAssigneesFromText(userCatalogResult, userText);
+      const ruleAssigneeName =
+        mentionedName ?? (textAssignees.length === 1 ? textAssignees[0].name : undefined);
+      for (const t of result.new_tasks) {
+        if (ruleAssigneeName) {
+          t.assignee = ruleAssigneeName;
+        } else if (SELF_REFERENCE_RE.test((t.assignee ?? "").trim()) && requestUserName) {
+          t.assignee = requestUserName;
+        }
+      }
+      // 単一タスクで最終的な担当者名がカタログに解決できない → 後段で聞き返す。
+      // ただしカタログが空(コールドスタート失敗等)のときは聞き返さず、承認時の解決に委ねる。
+      const assigneeNeedsHearing =
+        result.new_tasks.length === 1 &&
+        userCatalogResult.length > 0 &&
+        !assigneeResolver((result.new_tasks[0].assignee ?? "").trim());
+
+      // プロジェクト名のルールベース抽出（本文走査）。ちょうど1件ならそれを採用。
+      const ruleProjectMatches = extractProjectFromText(cachedProjectsResult, userText);
+
+      // プロジェクト未マッチ時の聞き返し情報（単一タスクのみ保持）
+      let projectSelection: { candidates: Array<{ id: string; name: string }>; query: string } | null = null;
+
       // Resolve projects and generate descriptions for each task, then build message in code
       const taskActions: Array<{ action: "create_task"; page_id: string; task_name: string; new_value: string }> = [];
       let needsDescriptionHearing = false;
@@ -937,41 +1123,30 @@ async function handleMention(
 
       for (let i = 0; i < result.new_tasks.length; i++) {
         const newTask = result.new_tasks[i];
-        // Resolve project before sending confirmation
-        // project="" means explicitly no project; project=null means use default
+        // プロジェクトを決定的に解決（ルール優先・曖昧時のみLLM）:
+        //   ① project="" → 明示的になし
+        //   ② 本文走査でちょうど1件 → それを採用（ルールベース）
+        //   ③ それ以外(0件/複数) → LLM抽出名 or チャンネル名にフォールバック
+        // 未マッチ時は候補提示で聞き返す（スプリント多数決デフォルトは廃止）。
         let resolvedProjectIds: string[] = [];
         let projectDisplay: string | null = null;
-
         if (newTask.project === "") {
-          // User explicitly said "no project"
           resolvedProjectIds = [];
           projectDisplay = null;
-        } else if (newTask.project) {
-          // 1) キャッシュ参照（チームプロジェクトカタログから正規名で解決）
-          const cachedHit = resolveProjectFromCache(cachedProjectsResult, newTask.project);
-          if (cachedHit) {
-            resolvedProjectIds = [cachedHit.id];
-            projectDisplay = cachedHit.name;
-          } else {
-            // 2) フォールバック: Notion /v1/search (新規プロジェクト追加直後など)
-            const candidates = await searchProjectsByName(config.notionToken, newTask.project, config.projectDbId);
-            if (candidates.length === 0) {
-              resolvedProjectIds = [];
-              projectDisplay = `${newTask.project}（⚠️ 未検出、プロジェクト未設定）`;
-            } else {
-              resolvedProjectIds = [candidates[0].id];
-              projectDisplay = candidates[0].name;
-            }
-          }
+        } else if (ruleProjectMatches.length === 1) {
+          resolvedProjectIds = [ruleProjectMatches[0].id];
+          projectDisplay = ruleProjectMatches[0].name;
         } else {
-          // null — use default project from sprint (pick only the most common one)
-          const defaultIds = summary.projectIds ?? [];
-          resolvedProjectIds = defaultIds.length > 0 ? [defaultIds[0]] : [];
-          if (resolvedProjectIds.length > 0) {
-            const titleMap = await fetchPageTitles(config, resolvedProjectIds);
-            const firstName = titleMap.get(resolvedProjectIds[0]);
-            if (firstName) {
-              projectDisplay = firstName;
+          const projRes = resolveTaskProject(newTask.project, channelInfoResult.name ?? "", cachedProjectsResult);
+          resolvedProjectIds = projRes.resolvedProjectIds;
+          projectDisplay = projRes.projectDisplay;
+          if (projRes.selection) {
+            if (result.new_tasks.length === 1 && projRes.selection.candidates.length > 0) {
+              projectSelection = projRes.selection;
+              projectDisplay = "（候補から選択）";
+            } else {
+              // 複数タスク or 候補なし(カタログ空)時は聞き返さず未設定にする
+              projectDisplay = "未設定（プロジェクト未特定）";
             }
           }
         }
@@ -1076,6 +1251,63 @@ async function handleMention(
       }
 
       const responseText = `以下のタスクを追加します。問題なければ ✅ 承認ボタンを押してください:\n\n${taskBlocks.join("\n\n")}`;
+
+      // ── 聞き返し①: 担当者が未解決（単一タスク）→ @メンション/名前で再指定を依頼 ──
+      // taskActions を pending として保存しておけば、スレッド返信が handleMention に
+      // 再投入され、pending_create_tasks 経由で担当者がマージ→再解決される。
+      if (assigneeNeedsHearing) {
+        const askText =
+          `${userMention}このタスクの担当者を特定できませんでした 🙇\n` +
+          `担当者を @メンション するか、お名前で教えてください。\n\n${responseText}`;
+        const askMsg = await chatPostMessage(config.slackBotToken, channel, askText, undefined, threadTs);
+        await savePendingAction(env.NOTIFY_CACHE, askMsg.channel, askMsg.ts, {
+          actions: taskActions,
+          requestedBy: userId,
+          requestedAt: new Date().toISOString(),
+          threadTs
+        });
+        await savePendingCreateRef(env.NOTIFY_CACHE, channel, threadTs, { confirmMsgTs: askMsg.ts });
+        await appendMentionHistory(env.NOTIFY_CACHE, channel, threadTs, userText, askText);
+        console.log(`Assignee hearing asked: task="${result.new_tasks[0].task_name}", ts=${askMsg.ts}`);
+        return;
+      }
+
+      // ── 聞き返し②: プロジェクト未マッチ（単一タスク）→ 候補を提示して番号選択 ──
+      if (projectSelection && projectSelection.candidates.length > 0) {
+        const task0 = JSON.parse(taskActions[0].new_value) as {
+          task_name: string; assignee: string; due: string; sp: number; status: string;
+          sprintId?: string; sprintName?: string | null; description?: string; relevantUrls?: string[];
+        };
+        const candidates = projectSelection.candidates;
+        const listText = candidates.map((c, idx) => `${idx + 1}. ${c.name}`).join("\n");
+        const noteTrunc = cachedProjectsResult.length > candidates.length
+          ? `\n（全${cachedProjectsResult.length}件中 上位${candidates.length}件を表示）`
+          : "";
+        const askText =
+          `${userMention}「${projectSelection.query}」に対応するプロジェクトを特定できませんでした。\n` +
+          `番号で選んでください（「キャンセル」で中止）:\n${listText}${noteTrunc}`;
+        await chatPostMessage(config.slackBotToken, channel, askText, undefined, threadTs);
+        await savePendingProjectSelection(env.NOTIFY_CACHE, channel, threadTs, {
+          newTask: {
+            task_name: task0.task_name,
+            assignee: task0.assignee,
+            due: task0.due,
+            sp: task0.sp,
+            status: task0.status,
+            ...(task0.sprintId ? { sprintId: task0.sprintId } : {}),
+            sprintName: task0.sprintName ?? null,
+            ...(task0.description ? { description: task0.description } : {}),
+            relevantUrls: task0.relevantUrls ?? []
+          },
+          candidates,
+          requestedBy: userId,
+          requestedAt: new Date().toISOString(),
+          fallbackProjectIds: []
+        });
+        await appendMentionHistory(env.NOTIFY_CACHE, channel, threadTs, userText, askText);
+        console.log(`Project selection asked: query="${projectSelection.query}", ${candidates.length} candidates`);
+        return;
+      }
 
       if (needsDescriptionHearing) {
         // Single task with no description — ask user for description
@@ -1661,7 +1893,7 @@ export async function handleSlackEvents(
 
   // ── app_mention ─────────────────────────────────────────────────────────
   if (eventType === "app_mention" && !botId) {
-    return respondAndProcess(() => handleMention(env, event));
+    return respondAndProcess(() => handleMention(env, event, botUserId));
   }
 
   // ── message (thread replies only, not from bots) ────────────────────────
@@ -1685,7 +1917,7 @@ export async function handleSlackEvents(
           if (!handled) {
             const createRef = await getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs);
             if (createRef) {
-              await handleMention(env, event);
+              await handleMention(env, event, botUserId);
             } else {
               await handleAssigneeReply(env, event);
               await handlePmReply(env, event);

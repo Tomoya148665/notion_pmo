@@ -247,6 +247,9 @@ export interface PendingProjectSelection {
     sp: number;
     status: string;
     sprintId?: string;
+    sprintName?: string | null;
+    description?: string;
+    relevantUrls?: string[];
   };
   candidates: Array<{ id: string; name: string }>;
   requestedBy: string;

@@ -400,7 +400,7 @@ export async function interpretRepliesAndPropose(
   const systemPrompt = `あなたはPMOアシスタントです。各担当者からのSlack返信を解釈し、
 稼働状況を把握した上でPM向けの日次レポートを作成してください。
 ${scheduleContext ? `\nGoogle スプレッドシートのマスタースケジュールデータも提供されています。
-pm_reportには以下のセクションを順番に含めてください:
+pm_reportには以下のセクションを含めてください:
 
 1. 【スケジュール分析】— 以下の形式で固定フォーマット:
   - スプリント名: {sprint.name} ({sprint.start_date} ～ {sprint.end_date})
@@ -410,15 +410,7 @@ pm_reportには以下のセクションを順番に含めてください:
   - 残り日数: {remaining_days} 日
   - 昨日消化SP: {yesterday_completed_sp} SP
   - 必要日次消化SP: {required_sp_per_day} SP/日
-  - 過去7日平均消化SP: {avg_daily_sp} SP/日
-
-2. 【メンバー稼働余力】— 各メンバーについて以下を1人1ブロックで表示:
-  - 名前
-  - 持ちタスク数と合計残SP
-  - 過去7日の平均SP消化速度（SP/日）
-  - 現ペースで持ちタスクが全て完了する予測日
-  - 予測完了日がスプリント終了日より前なら「余力あり」、後なら「タスク過多」と明記する
-  - ※「スプリント終了日までの遊休日数」は表示しないこと` : ""}
+  - 過去7日平均消化SP: {avg_daily_sp} SP/日` : ""}
 日本語で回答してください。
 
 ■ pm_report フォーマットルール（Slack向け）:
@@ -429,7 +421,7 @@ pm_reportには以下のセクションを順番に含めてください:
 - セクション間は空行で区切る
 - 全体を簡潔かつ一覧性高くする（PMが30秒で把握できるように）
 - SP表示は当該スプリントのplan_sp/progress_spを使うこと（マスタースケジュールの全体計画SP600ではなく、スプリント単位のSPで表示する）
-- 指定されたセクション（【スケジュール分析】【メンバー稼働余力】）以外のセクションは追加しないこと。【推奨対応】【アクションアイテム】【所感】等の追加セクションは不要`;
+- 指定されたセクション（【スケジュール分析】）以外のセクションは追加しないこと。【メンバー稼働余力】【推奨対応】【アクションアイテム】【所感】等の追加セクションは不要`;
 
   const repliesForPrompt = activeThreads.map((t) => ({
     assignee: t.assigneeName,
@@ -593,25 +585,35 @@ export async function interpretMention(
 
 **create_task（タスク追加）**: 新しいタスクをNotionに追加するリクエスト
 - 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限 YYYY-MM-DD）、sp（SP）
-- オプション項目: project（プロジェクト名）- available_projects（チームが対応中のプロジェクト一覧）に存在する name を必ず使う。リスト外の名前を返してはならない。判断手順:
-  1. ユーザーが明示的にプロジェクト名を指定 → available_projects の中で最も近い候補の name をそのままセット
-  2. 明示なし → channel_name、thread_context、task_name の総合判断で available_projects から最適な1件を選んでセット（チャンネル名は最強のヒント。例: channel_name="proj-mitsui" → "三井住友海上" が最有力）
-  3. available_projects に当てはまる候補が一つもない → null（システムがデフォルトプロジェクトを補完する）
-  4. ユーザーが「プロジェクトはなし」「プロジェクトなしで」等と明示的に外した場合 → 空文字 ""
-  5. available_projects が提供されていない場合 → null
+- ⚠️ due（期限）の決定ルール（厳守・最優先）:
+  1. 会話（user_message・thread_context・channel_context・conversation_history）のどこかに期限が書かれていたら、必ずそれを最優先で使う。
+     「これ起票して」「それタスク化」等の「これ/それ」が指す直前のメッセージ群に期限が書かれていることが非常に多い。起票指示の前後のメッセージを必ず確認すること。
+     - 相対表現は user_prompt の today（YYYY-MM-DD）を基準に変換する: 「今日」→today / 「明日」→todayの翌日 / 「明後日」→today+2日 / 「今週中」「今週末」「今週金曜」→今週の金曜 / 「来週○曜」→翌週の該当曜日 / 「○/○」「○月○日」→その日付（年は当年、過ぎていれば翌年）
+     - 時刻表現（「14時まで」「午前中」「夕方まで」等）は日付に影響させない。日付(YYYY-MM-DD)だけを返す。例: today が 2026-05-31 のとき「明日の14時まで」→ "2026-06-01"
+  2. 会話のどこにも期限の言及が無い場合のみ → **SP の値に応じて** default_due_by_sp から選ぶ:
+     - SP ≤ 3 → default_due_by_sp.lte3 / SP 4-5 → default_due_by_sp.lte5 / SP 6-8 → default_due_by_sp.lte8 / SP > 8 → default_due_by_sp.gt8
+  3. ⛔ 会話に期限が書かれているのに SP デフォルトを使ってはならない（1 が 2 に優先する）
+  4. ⛔ sprint.end_date や available_sprints の end_date を due として流用してはならない（スプリント終了日 ≠ タスク期限）
+  5. ⛔ current_tasks の他タスクの due を勝手に流用してはならない
+  6. ⛔ today より過去の日付を due にセットしてはならない（会話に明示された過去日を除く）
+- オプション項目: project（プロジェクト名）- ⚠️ あなたは「ユーザーが明示的に言ったプロジェクト名の抽出」だけを行う。カタログ照合やチャンネル名からの推測はシステム側が決定的に行うので、推測してはならない。判断手順:
+  1. ユーザーが明示的にプロジェクト名を口にした → その名前を**言われたまま**セット（例: 「三井の件で」→ "三井"）。正規化や候補選択はしない
+  2. ユーザーがプロジェクトに言及していない → null（システムがチャンネル名からプロジェクトを決定する）
+  3. ユーザーが「プロジェクトはなし」「プロジェクトなしで」等と明示的に外した → 空文字 ""
+  - ⚠️ チャンネル名・thread_context・task_name からプロジェクトを推測して名前をでっち上げてはならない。明示が無ければ必ず null
 - オプション項目: description（概要）- システムが自動生成した概要。ユーザーが修正を依頼した場合のみ変更する
 - オプション項目: sprint（スプリント名）- available_sprintsに含まれるスプリント名を指定する。ユーザーが「スプリントに入れて」「現スプリントに追加」等と指定した場合にセットする。未指定またはユーザーが「スプリントはまだ設定しないで」等と指示した場合はnull。⚠️「バックログ」はステータスの値であってスプリント名ではない — sprintに"バックログ"を入れないこと。デフォルトはnull
 - 複数タスクの同時作成に対応: スレッド内容から複数のタスクが識別できる場合、new_tasksに複数のタスクを含める
 - ⚠️ タスク情報の出典ルール（厳守）:
-  - task_nameはuser_message、thread_context、channel_context、current_tasksのいずれかに根拠があること
-  - thread_contextにTODO項目や作業内容がある場合、それをタスクとして起票する（スレッド内の情報を最優先で活用する）
-  - どこにも存在しないタスク名を捏造してはならない
+  - タスクの中身（task_name・description）は、会話（thread_context / channel_context / user_message）で実際に語られている内容を整理して作る。「これ/それ起票して」と言われたら、その「これ/それ」が指す直前のやり取り（作業内容・手順・期限）を整理して反映する
+  - task_name は会話の内容を端的に表す名前にする（thread_context / channel_context / user_message / current_tasks に根拠があること）
+  - 会話に根拠のないタスク名・内容を current_tasks や reference_db から借りて捏造してはならない。あくまで「いま会話で言われていること」を優先する
 - 全ての必須項目が揃っている場合:
   - intent = "create_task"
   - response_textに確認メッセージを生成（全タスクの詳細を一覧表示 + 「✅ 承認ボタンを押してください」）
   - response_textに📝概要は含めない（システム側で別途表示する）
   - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusはユーザーが指定しない限り "Backlog"
-  - descriptionは新規作成時はnull（システムが後から自動生成する）。thread_contextがある場合はスレッド内容からタスクの目的・背景・やるべきことだけを抽出して200字以内の概要をセット（「起票して」「担当を変更」「SPを○に」等のBot操作指示や、担当者名・期限・SP等のメタ情報は概要に含めない）
+  - descriptionは、thread_context / channel_context など会話に十分な情報があれば、その内容（タスクの目的・背景・やるべきこと・手順）を整理して200字以内の概要をセットする。会話に手掛かりが無い場合のみ null（システムが後から自動生成）。「起票して」「担当を変更」「SPを○に」等のBot操作指示や、担当者名・期限・SP等のメタ情報は概要に含めない
 - 必須項目が不足している場合:
   - intent = "create_task"
   - response_textに不足項目を質問するメッセージを生成（「タスク名と期限は分かりましたが、担当者とSPを教えてください！」）
@@ -640,7 +642,7 @@ export async function interpretMention(
   - ステータスに言及していない修正の場合 → pending_create_tasksのstatusをそのまま引き継ぐ
 - プロジェクト（project）の修正:
   - 「プロジェクトはなし」「プロジェクト外して」「プロジェクトなしで」→ projectを""（空文字）にセット
-  - 「プロジェクトは○○」「プロジェクトを○○にして」→ available_projects の中で○○に最も近い候補の name をセット（available_projectsが提供されていない場合のみ、○○の部分をそのままセット）
+  - 「プロジェクトは○○」「プロジェクトを○○にして」→ ○○の部分を**言われたまま**projectにセット（カタログ照合はシステムが行う）
   - プロジェクトに言及していない修正の場合 → pending_create_tasksのprojectをそのまま引き継ぐ
 - スプリント（sprint）の修正:
   - 「スプリントに入れて」「現スプリントに追加」→ available_sprintsから該当スプリント名をsprintにセット
@@ -750,6 +752,19 @@ export async function interpretMention(
   const weekEnd = new Date(weekStart);
   weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
 
+  // create_task で due が明示されない場合のデフォルト期限 (SP に応じて today + N日, JST)
+  const addJstDays = (n: number): string => {
+    const d = new Date(jst);
+    d.setUTCDate(jst.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  const defaultDueBySp = {
+    lte3: addJstDays(2),   // SP ≤ 3 → 2日後
+    lte5: addJstDays(3),   // SP 4-5 → 3日後
+    lte8: addJstDays(4),   // SP 6-8 → 4日後
+    gt8: addJstDays(5)     // SP > 8 → 5日後
+  };
+
   const hasHistory = conversationHistory && conversationHistory.length > 0;
 
   const userPrompt = JSON.stringify({
@@ -757,30 +772,38 @@ export async function interpretMention(
     today,
     week_start: weekStart.toISOString().slice(0, 10),
     week_end: weekEnd.toISOString().slice(0, 10),
+    default_due_by_sp: defaultDueBySp,
     ...(requestUserName ? { request_user: { name: requestUserName } } : {}),
     ...(hasHistory ? { conversation_history: conversationHistory } : {}),
     sprint: summary.sprint,
-    current_tasks: summary.assignees.map((a) => ({
-      assignee: a.name,
-      tasks: a.tasks.map((t) => ({
-        id: t.id,
-        name: t.name,
-        status: t.status,
-        sp: t.sp,
-        due: t.due,
-        priority: t.priority,
-        projectName: t.projectName ?? null
-      }))
-    })),
-    sprint_metrics: context.sprintMetrics,
-    avg_daily_sp: context.avgDailySp,
+    // Below fields are only included when they have meaningful data — keeps the LLM prompt small
+    // when this is a simple create-task request and metrics aren't needed.
+    ...(summary.assignees.length > 0
+      ? {
+          current_tasks: summary.assignees.map((a) => ({
+            assignee: a.name,
+            tasks: a.tasks.map((t) => ({
+              id: t.id,
+              name: t.name,
+              status: t.status,
+              sp: t.sp,
+              due: t.due,
+              priority: t.priority,
+              projectName: t.projectName ?? null
+            }))
+          }))
+        }
+      : {}),
+    ...(context.sprintMetrics && (context.sprintMetrics.plan_sp != null || context.sprintMetrics.progress_sp != null)
+      ? { sprint_metrics: context.sprintMetrics }
+      : {}),
+    ...(context.avgDailySp != null ? { avg_daily_sp: context.avgDailySp } : {}),
     members: context.members,
-    schedule_deviation: context.scheduleDeviation,
-    weekly_diff: context.weeklyDiff,
-    stagnant_tasks: context.stagnantTasks,
-    available_sprints: context.availableSprints,
+    ...(context.scheduleDeviation ? { schedule_deviation: context.scheduleDeviation } : {}),
+    ...(context.weeklyDiff ? { weekly_diff: context.weeklyDiff } : {}),
+    ...(context.stagnantTasks && context.stagnantTasks.length > 0 ? { stagnant_tasks: context.stagnantTasks } : {}),
+    ...(context.availableSprints.length > 0 ? { available_sprints: context.availableSprints } : {}),
     ...(context.channelName ? { channel_name: context.channelName } : {}),
-    ...(context.availableProjects && context.availableProjects.length > 0 ? { available_projects: context.availableProjects } : {}),
     ...(pendingCreateTasks && pendingCreateTasks.length > 0 ? { pending_create_tasks: pendingCreateTasks } : {}),
     ...(pendingUpdateActions ? { pending_update_actions: pendingUpdateActions } : {}),
     ...(threadContext && threadContext.length > 0 ? { thread_context: threadContext } : {}),

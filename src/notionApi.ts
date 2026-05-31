@@ -695,6 +695,70 @@ export async function fetchCurrentSprintTasksSummary(
   };
 }
 
+/**
+ * 期限(「期限」プロパティ)が [startDate, endDate] に入る未完了タスクを、スプリントに関係なく取得する。
+ * extractTaskRow が完了タスクを除外し、担当者ごとにグルーピング＋プロジェクト名を解決して返す。
+ * タスクリマインド（期限ベース）用。
+ */
+export async function fetchTasksByDueRange(
+  config: AppConfig,
+  startDate: string,
+  endDate: string,
+  dueProperty = "期限"
+): Promise<{ assignees: SprintTasksSummary["assignees"] }> {
+  const taskDbId = await resolveDatabaseId(config, {
+    url: config.taskDbUrl,
+    name: config.taskDbName,
+    label: "TASK_DB"
+  });
+
+  const taskPages = await queryDatabase(
+    config,
+    taskDbId,
+    {
+      // Notion は1つの date 条件に on_or_after と on_or_before を同時指定できない。
+      // 両端で絞るには and 複合フィルタにする必要がある。
+      filter: {
+        and: [
+          { property: dueProperty, date: { on_or_after: startDate } },
+          { property: dueProperty, date: { on_or_before: endDate } }
+        ]
+      },
+      sorts: [{ property: dueProperty, direction: "ascending" }]
+    },
+    10
+  );
+
+  const tasks: TaskRow[] = [];
+  for (const page of taskPages) {
+    const task = extractTaskRow(page); // 完了タスクは null になる
+    if (task) tasks.push(task);
+  }
+
+  const assignees = groupTasksByAssignee(tasks);
+
+  // プロジェクト名を解決して各タスクに付与（fetchCurrentSprintTasksSummary と同じ手順）
+  const uniqueProjectIds = [...new Set(tasks.flatMap((t) => t.projectIds))];
+  if (uniqueProjectIds.length > 0) {
+    const projectNameMap = await fetchPageTitles(config, uniqueProjectIds);
+    const taskProjectNameMap = new Map<string, string>();
+    for (const task of tasks) {
+      if (task.projectIds.length > 0) {
+        const firstName = projectNameMap.get(task.projectIds[0]);
+        if (firstName) taskProjectNameMap.set(task.id, firstName);
+      }
+    }
+    for (const assignee of assignees) {
+      for (const task of assignee.tasks) {
+        task.projectName = taskProjectNameMap.get(task.id) ?? null;
+      }
+    }
+  }
+
+  console.log(`fetchTasksByDueRange: ${tasks.length} tasks in ${startDate}~${endDate} across ${assignees.length} assignees`);
+  return { assignees };
+}
+
 interface MemberCapacity {
   name: string;
   totalHours: number;
@@ -838,6 +902,54 @@ export async function fetchSprintCapacity(
     capacities.map((c) => `${c.name}: total=${c.totalHours}h, remaining=${c.remainingHours}h`));
 
   return capacities;
+}
+
+/**
+ * Lightweight version of fetchCurrentSprintTasksSummary — fetches ONLY the current sprint info
+ * (id, name, start_date, end_date) without querying task DB. Used in the create-task fast path
+ * where we don't need the task list.
+ */
+export async function fetchCurrentSprintInfo(
+  config: AppConfig,
+  now: Date
+): Promise<SprintTasksSummary> {
+  const sprintDbId = await resolveDatabaseId(config, {
+    url: config.sprintDbUrl,
+    name: config.sprintDbName,
+    label: "SPRINT_DB"
+  });
+
+  const dateProp = config.notionDateProperty;
+  const sprintPages = await queryDatabase(config, sprintDbId, {}, 10);
+  if (sprintPages.length === 0) {
+    throw new Error("Sprint DB query returned no results");
+  }
+
+  const today = toJstDateString(now);
+  const sprintCandidates = sprintPages
+    .map((page) => extractSprintInfo(page, dateProp))
+    .filter((sprint): sprint is SprintInfo => sprint != null);
+  if (sprintCandidates.length === 0) {
+    throw new Error("Sprint records did not contain a valid period property");
+  }
+
+  let sprint =
+    sprintCandidates.find((s) => isDateInRange(today, s.start_date, s.end_date)) ??
+    sprintCandidates.find((s) => isActiveStatus(s.status));
+  if (!sprint) sprint = sprintCandidates[0];
+
+  return {
+    sprint: {
+      id: sprint.id,
+      name: sprint.name,
+      start_date: sprint.start_date,
+      end_date: sprint.end_date,
+      status: sprint.status
+    },
+    sprint_metrics: { plan_sp: null, progress_sp: null, required_sp_per_day: null },
+    assignees: [],
+    projectIds: []
+  };
 }
 
 export async function fetchAllSprints(

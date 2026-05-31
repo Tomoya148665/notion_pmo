@@ -154,6 +154,86 @@ export function resolveProjectFromCache(
 }
 
 /**
+ * Slackチャンネル名からプロジェクトを推定する。
+ * チャンネル名は "proj-mitsui" のように区切り文字やノイズを含むため、
+ * (1) 名前全体での照合 → (2) 区切りで分割したトークンごとの照合 を試す。
+ * 例: "proj-mitsui" → トークン "mitsui" がカタログ名に部分一致すれば採用。
+ */
+export function resolveProjectByChannelName(
+  projects: CachedProject[],
+  channelName: string
+): CachedProject | null {
+  if (!channelName) return null;
+
+  // (1) チャンネル名全体での照合
+  const whole = resolveProjectFromCache(projects, channelName);
+  if (whole) return whole;
+
+  // (2) 区切り文字で分割したトークン（長い順）で照合
+  const tokens = channelName
+    .split(/[-_/\s　.,]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2)
+    .sort((a, b) => b.length - a.length);
+
+  for (const token of tokens) {
+    const hit = resolveProjectFromCache(projects, token);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * 与えられたクエリに近い順でプロジェクト候補を返す（未マッチ時の聞き返し用）。
+ * 部分一致するものを名前長の近さ順で優先し、足りなければ残りのカタログで埋める。
+ */
+export function topProjectCandidates(
+  projects: CachedProject[],
+  query: string,
+  limit = 10
+): CachedProject[] {
+  const nQuery = normalize(query ?? "");
+  const matched: CachedProject[] = [];
+  const rest: CachedProject[] = [];
+
+  for (const p of projects) {
+    const nName = normalize(p.name);
+    if (nQuery && (nName.includes(nQuery) || nQuery.includes(nName))) {
+      matched.push(p);
+    } else {
+      rest.push(p);
+    }
+  }
+  matched.sort(
+    (a, b) => Math.abs(a.name.length - query.length) - Math.abs(b.name.length - query.length)
+  );
+  return [...matched, ...rest].slice(0, limit);
+}
+
+/**
+ * メッセージ本文を走査し、カタログのプロジェクト名が出現するものを返す（ルールベース抽出）。
+ * 正規化した本文に、正規化したプロジェクト名(2文字以上)が部分文字列として含まれるかで判定。
+ * 高精度優先（フルネーム一致）。言い換え等で取りこぼした場合は呼び出し側がLLM値にフォールバックする。
+ */
+export function extractProjectFromText(
+  projects: CachedProject[],
+  text: string
+): CachedProject[] {
+  const nText = normalize(text ?? "");
+  if (!nText) return [];
+  const seen = new Set<string>();
+  const matches: CachedProject[] = [];
+  for (const p of projects) {
+    const nName = normalize(p.name);
+    if (nName.length >= 2 && nText.includes(nName) && !seen.has(p.id)) {
+      seen.add(p.id);
+      matches.push(p);
+    }
+  }
+  return matches;
+}
+
+/**
  * プロジェクトカタログを更新してKVに保存する。
  * cron / 手動エンドポイント / コールドスタート時のフェイルセーフから呼ばれる。
  */

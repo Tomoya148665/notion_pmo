@@ -40,7 +40,7 @@ return new Response(readable, { status: 200 });
 
 ### Interactivity URL の設定
 - ボタン等のインタラクティブコンポーネントを使う場合、Slack App Settings の Interactivity & Shortcuts で Request URL を設定する必要がある
-- URL: `https://notion-sprint-worker.kaede-pmo.workers.dev/slack/interactions`
+- URL: `https://notion-sprint-worker-dev.tomoya-kotetsu.workers.dev/slack/interactions`
 
 ## 3. Notion API アクション
 
