@@ -200,6 +200,10 @@ export interface MentionContext {
   }>;
   channelName?: string;
   availableProjects?: Array<{ id: string; name: string }>;
+  /** このスレッドで作成済みのタスク（current_tasksに無いスプリント未設定タスクの更新に使用） */
+  threadCreatedTasks?: Array<{ pageId: string; taskName: string }>;
+  /** タスクDBのステータス選択肢（doing(20%) 等の実際の値。ユーザーの曖昧指定をマッピングする） */
+  availableStatuses?: string[];
 }
 
 // ── PMO Agent schemas ──────────────────────────────────────────────────────

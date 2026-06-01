@@ -14,7 +14,8 @@ import {
   appendReply,
   savePhoneReminder,
   getPhoneReminder,
-  deletePhoneReminder
+  deletePhoneReminder,
+  appendThreadCreatedTasks
 } from "./workflow";
 import {
   executeNotionActions,
@@ -439,6 +440,16 @@ async function handleTaskActionButton(
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
     if (pending.threadTs) {
       await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
+    }
+
+    // 作成したタスクの page_id をスレッド単位で記憶（後続の「担当者変更」等で参照できるように）
+    const threadKey = threadTs ?? pending.threadTs ?? messageTs;
+    const createdForThread = taskResults
+      .filter((r) => r.result.pageId)
+      .map((r) => ({ pageId: r.result.pageId as string, taskName: r.newTask.task_name }));
+    if (createdForThread.length > 0) {
+      await appendThreadCreatedTasks(env.NOTIFY_CACHE, channel, threadKey, createdForThread).catch(() => {});
+      console.log(`Saved ${createdForThread.length} created task(s) for thread ${threadKey}`);
     }
 
     // Update original message: remove buttons, add result

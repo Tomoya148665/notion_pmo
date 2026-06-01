@@ -335,6 +335,46 @@ export async function deletePendingCreateRef(
   await kv.delete(PENDING_CREATE_REF_KEY(channel, threadTs));
 }
 
+// ── スレッド内で作成したタスク (作成後の page_id を記憶し、後続の更新で参照) ───
+export interface ThreadCreatedTask {
+  pageId: string;
+  taskName: string;
+}
+
+const THREAD_CREATED_TASKS_KEY = (channel: string, threadTs: string) =>
+  `thread-created-tasks:${channel}:${threadTs}`;
+
+/** スレッドで作成したタスクを追記保存（同名は最新で上書き）。 */
+export async function appendThreadCreatedTasks(
+  kv: KVNamespace,
+  channel: string,
+  threadTs: string,
+  tasks: ThreadCreatedTask[]
+): Promise<void> {
+  if (tasks.length === 0) return;
+  const key = THREAD_CREATED_TASKS_KEY(channel, threadTs);
+  const raw = await kv.get(key);
+  const existing: ThreadCreatedTask[] = raw ? JSON.parse(raw) : [];
+  const merged = [...existing.filter((e) => !tasks.some((t) => t.pageId === e.pageId)), ...tasks];
+  await kv.put(key, JSON.stringify(merged), { expirationTtl: DEFAULT_TTL });
+}
+
+/** スレッドで作成したタスク一覧を取得。 */
+export async function getThreadCreatedTasks(
+  kv: KVNamespace,
+  channel: string,
+  threadTs: string
+): Promise<ThreadCreatedTask[]> {
+  const raw = await kv.get(THREAD_CREATED_TASKS_KEY(channel, threadTs)).catch(() => null);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as ThreadCreatedTask[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 // ── Phone Reminder (☎️ reaction-based reminders with time selection) ─────
 
 export interface PhoneReminder {

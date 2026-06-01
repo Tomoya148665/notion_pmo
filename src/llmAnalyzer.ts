@@ -563,6 +563,11 @@ export async function interpretMention(
 - response_textには簡潔な確認メッセージのみ生成（例: 「SPを5に変更します」）。確認UIはシステムが自動生成するため、対象タスクの詳細や承認指示は不要
 - actionsに実行するNotion更新アクションを配列で返す。変更対象の項目のみ含める（変更しない項目のアクションは不要）
 - page_idはタスクリストに含まれるIDを必ず使用する（存在しないIDは使わない）
+- ⚠️ 対象タスクの探索順序: ① current_tasks ② **thread_created_tasks**（このスレッドで直前に作成したタスク。スプリント未設定でcurrent_tasksに無いことが多い）。thread_created_tasks がある場合、ユーザーが「このタスク」「先ほどのタスク」等と言ったら、それは thread_created_tasks のタスクを指す。その page_id を使う
+- スレッド内で1つだけタスクを作成した直後の更新依頼（担当者変更・SP変更等）は、対象が明示されなくても thread_created_tasks のそのタスクを対象とする（「どのタスクか不明」と聞き返さない）
+- 担当者変更で複数人を指定された場合（例「松田と北川に」）、new_valueにカンマ区切りで全員の名前を入れる（例: "松田, 北川"）
+- update_status（ステータス変更）の new_value は **available_statuses**（実際の選択肢）の値を使う。ユーザーの曖昧指定を最も近い値にマッピング（例:「20%」→"doing(20%)"、「完了」→"完了"、「保留/ペンディング」→"ペンディング"、「中止」→"中止"）。available_statuses 外の値は使わない
+- 複数のプロパティを同時に変更する依頼（例「担当者を松田にして、ステータスを20%に」）は、それぞれを別の action として actions 配列に複数入れる（update_assignee と update_status を両方返す）
 - ユーザーの指示が曖昧で複数タスクに該当しうる場合は、候補を列挙してどのタスクか確認する（intent="query"、actionsは空）
 - new_tasksは空配列 []
 
@@ -636,9 +641,14 @@ export async function interpretMention(
   - 「概要なし」「概要を削除」「スキップ」→ descriptionをnullにセット
   - 概要に言及していない修正の場合 → pending_create_tasksのdescriptionをそのまま引き継ぐ
 - ステータス（status）の修正:
-  - 「ステータスはreadyで」「readyにして」→ statusを"Ready"にセット
-  - 「doingにして」→ statusを"Doing"にセット
-  - その他の有効なステータス値: "Backlog", "Ready", "Doing", "Review", "Done"
+  - ⚠️ ステータス値は必ず **available_statuses**（タスクDBの実際の選択肢）の中から選ぶこと。available_statuses が提供されていない場合のみ "Backlog","Ready","Doing","Review","Done" を使う
+  - ユーザーの曖昧・略式の指定を available_statuses の最も近い値にマッピングする。例:
+    - 「20%」「20%にして」→ available_statuses 内の "doing(20%)" 等の該当値
+    - 「完了」「done」→ "完了" or "Done"（available_statuses にある方）
+    - 「レビュー」「他者ボール」→ "他者ボール・レビュー中" 等
+    - 「保留」「ペンディング」→ "ペンディング"
+    - 「中止」→ "中止"
+  - available_statuses に該当する値が無い場合のみ、ユーザーに選択肢を提示して聞き返す
   - ステータスに言及していない修正の場合 → pending_create_tasksのstatusをそのまま引き継ぐ
 - プロジェクト（project）の修正:
   - 「プロジェクトはなし」「プロジェクト外して」「プロジェクトなしで」→ projectを""（空文字）にセット
@@ -803,7 +813,11 @@ export async function interpretMention(
     ...(context.weeklyDiff ? { weekly_diff: context.weeklyDiff } : {}),
     ...(context.stagnantTasks && context.stagnantTasks.length > 0 ? { stagnant_tasks: context.stagnantTasks } : {}),
     ...(context.availableSprints.length > 0 ? { available_sprints: context.availableSprints } : {}),
+    ...(context.availableStatuses && context.availableStatuses.length > 0 ? { available_statuses: context.availableStatuses } : {}),
     ...(context.channelName ? { channel_name: context.channelName } : {}),
+    ...(context.threadCreatedTasks && context.threadCreatedTasks.length > 0
+      ? { thread_created_tasks: context.threadCreatedTasks.map((t) => ({ page_id: t.pageId, name: t.taskName })) }
+      : {}),
     ...(pendingCreateTasks && pendingCreateTasks.length > 0 ? { pending_create_tasks: pendingCreateTasks } : {}),
     ...(pendingUpdateActions ? { pending_update_actions: pendingUpdateActions } : {}),
     ...(threadContext && threadContext.length > 0 ? { thread_context: threadContext } : {}),

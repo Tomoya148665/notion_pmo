@@ -38,7 +38,7 @@ import { chatPostMessage, conversationsOpen, uploadImageToSlack } from "./slackB
 import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
 import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName, resolveMemberByName } from "./userCatalog";
 import { buildTimelinePng, renderTimelineHtml } from "./timeline";
-import { captureAssigneeBoards, captureNotionTimeline, getNotionSession, DEFAULT_NOTION_BOARD_URL, DEFAULT_NOTION_TIMELINE_URL } from "./notionBoard";
+import { captureAssigneeBoards, captureNotionTimeline, captureNotionTimelineDebug, fetchNotionAvatarMap, getNotionSession, DEFAULT_NOTION_BOARD_URL, DEFAULT_NOTION_TIMELINE_URL } from "./notionBoard";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -1089,10 +1089,12 @@ async function runTaskReminderFlow(
     try {
       const session = await getNotionSession(env.NOTIFY_CACHE);
       if (session) {
+        // 担当者アバターの実URL(avatar_url)を API から取得しておく（白い丸対策）
+        const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
         // ① Notion タイムラインビュー
         try {
           const tlUrl = env.NOTION_TIMELINE_VIEW_URL || DEFAULT_NOTION_TIMELINE_URL;
-          const tlPng = await captureNotionTimeline(env.BROWSER, session, tlUrl);
+          const tlPng = await captureNotionTimeline(env.BROWSER, session, tlUrl, avatarMap);
           if (tlPng) {
             await uploadImageToSlack(
               config.slackBotToken,
@@ -1112,7 +1114,7 @@ async function runTaskReminderFlow(
 
         // ② 担当者ごとのボード
         const boardUrl = env.NOTION_BOARD_VIEW_URL || DEFAULT_NOTION_BOARD_URL;
-        const boards = await captureAssigneeBoards(env.BROWSER, session, boardUrl);
+        const boards = await captureAssigneeBoards(env.BROWSER, session, boardUrl, avatarMap);
         for (const b of boards) {
           await uploadImageToSlack(
             config.slackBotToken,
@@ -2018,6 +2020,19 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
         return new Response(renderTimelineHtml(tlTasks, dueStart, dueEnd, today), {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
+      }
+      // ?debug=notion → 実Notionタイムラインのアバター画像読み込み状態を計測して返す
+      if (url.searchParams.get("debug") === "notion" || url.searchParams.get("debug") === "notionpng") {
+        const session = await getNotionSession(env.NOTIFY_CACHE);
+        const tlUrl = env.NOTION_TIMELINE_VIEW_URL || DEFAULT_NOTION_TIMELINE_URL;
+        const wantPng = url.searchParams.get("debug") === "notionpng";
+        const avatarMap = await fetchNotionAvatarMap(getConfig(env).notionToken).catch(() => ({}));
+        const diag = await captureNotionTimelineDebug(env.BROWSER, session, tlUrl, wantPng, avatarMap);
+        if (wantPng && diag.png) {
+          return new Response(diag.png as unknown as BodyInit, { headers: { "Content-Type": "image/png" } });
+        }
+        const { png, ...rest } = diag;
+        return jsonResponse(rest);
       }
       // ?debug=png → Browser Rendering で描画したスクショPNGを返す（Slack投稿せず確認用）
       if (url.searchParams.get("debug") === "png") {

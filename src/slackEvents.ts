@@ -20,14 +20,15 @@ import {
   deletePendingCreateRef,
   toJstDateString,
   savePhoneReminder,
-  deletePhoneReminder
+  deletePhoneReminder,
+  getThreadCreatedTasks
 } from "./workflow";
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen, conversationsInfo, usersInfo } from "./slackBot";
 import { ensureProjectCatalog, resolveProjectFromCache, resolveProjectByChannelName, topProjectCandidates, extractProjectFromText, type CachedProject } from "./projectCatalog";
 import { ensureUserCatalog, makeAssigneeResolver, resolveMemberBySlackId, extractAssigneesFromText, type AssigneeResolver, type CachedUser } from "./userCatalog";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
-import { fetchCurrentSprintTasksSummary, fetchCurrentSprintInfo, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems } from "./notionApi";
+import { fetchCurrentSprintTasksSummary, fetchCurrentSprintInfo, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchTaskStatusOptions } from "./notionApi";
 import { fetchMembers } from "./memberApi";
 import {
   calculateAvgDailySpConsumption,
@@ -337,13 +338,29 @@ export async function executeNotionActions(
         continue;
       }
       try {
-        // Resolve assignee name → Notion user ID using the member resolver
-        // (handles kanji/hiragana/romaji/honorific variations like "古鉄" → "古鉄朋也 / Tomoya Kotetsu")
-        const resolvedId = resolveAssignee ? resolveAssignee(action.new_value) : undefined;
-        await updateTaskPage(token, action.page_id, { assignee: action.new_value, assigneeId: resolvedId });
+        // 複数担当者対応: "松田, 北川" 等をカンマ/読点/スラッシュで分割し、各名を個別に解決
+        const names = action.new_value
+          .split(/[,、，･・\/／]/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        const resolvedIds: string[] = [];
+        const unresolved: string[] = [];
+        for (const n of names) {
+          const id = resolveAssignee ? resolveAssignee(n) : undefined;
+          if (id && !resolvedIds.includes(id)) resolvedIds.push(id);
+          else if (!id) unresolved.push(n);
+        }
         const link = notionPageUrl(action.page_id);
-        const note = resolvedId ? "" : "（⚠️ Notion ユーザー未検出のため未設定）";
-        results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${action.new_value}${note}`);
+        if (resolvedIds.length > 0) {
+          // 解決できた担当者を people 配列にまとめてセット（複数可）
+          await updateTaskPage(token, action.page_id, { assigneeIds: resolvedIds });
+          const note = unresolved.length > 0 ? `（⚠️ 未検出: ${unresolved.join(", ")}）` : "";
+          results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${names.join(", ")}${note}`);
+        } else {
+          // 1人も解決できなかった場合は名前ベースのフォールバック（単一名）
+          await updateTaskPage(token, action.page_id, { assignee: action.new_value });
+          results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${action.new_value}（⚠️ Notion ユーザー未検出のため未設定）`);
+        }
       } catch (err) {
         console.error(`Failed to update assignee for ${action.page_id}`, (err as Error).message);
         results.push(`・${action.task_name}: 担当者変更失敗 (${(err as Error).message})`);
@@ -1054,6 +1071,19 @@ async function handleMention(
     const trimmedReferenceItems = referenceItems
       ?.map((r) => ({ ...r, content: r.content.slice(0, 500) }))
       .slice(0, 10);
+
+    // スレッドで作成済みのタスク（スプリント未設定でcurrent_tasksに無いもの）を更新対象に含める
+    const threadCreatedTasks = await getThreadCreatedTasks(env.NOTIFY_CACHE, channel, threadTs).catch(() => []);
+    if (threadCreatedTasks.length > 0) {
+      mentionContext.threadCreatedTasks = threadCreatedTasks;
+      console.log(`Thread created tasks available for update: ${threadCreatedTasks.map((t) => t.taskName).join(", ")}`);
+    }
+
+    // タスクDBの実際のステータス選択肢をLLMに渡す（doing(20%) 等の曖昧指定マッピング用）
+    const availableStatuses = await fetchTaskStatusOptions(config).catch(() => []);
+    if (availableStatuses.length > 0) {
+      mentionContext.availableStatuses = availableStatuses;
+    }
 
     const result = await interpretMention(config, userText, summary, mentionContext, requestUserName, conversationHistory, pendingCreateTasks, pendingUpdateActions, trimmedThreadContext, trimmedChannelContext, trimmedReferenceItems);
 

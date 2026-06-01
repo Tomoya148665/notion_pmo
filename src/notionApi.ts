@@ -1030,6 +1030,35 @@ export interface ReferenceItem {
   content: string;
 }
 
+// タスクDBの「ステータス」プロパティの選択肢を取得（プロセス内キャッシュ）。
+// LLM に実際の選択肢(doing(20%) 等)を渡し、ユーザーの曖昧指定をマッピングさせる。
+let cachedStatusOptions: string[] | null = null;
+export async function fetchTaskStatusOptions(config: AppConfig): Promise<string[]> {
+  if (cachedStatusOptions) return cachedStatusOptions;
+  const taskDbId = config.taskDbId || extractNotionIdFromUrl(config.taskDbUrl);
+  if (!taskDbId) return [];
+  try {
+    const res = await fetch(`https://api.notion.com/v1/databases/${taskDbId}`, {
+      headers: {
+        Authorization: `Bearer ${config.notionToken}`,
+        "Notion-Version": NOTION_VERSION,
+      },
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      properties?: Record<string, { type?: string; status?: { options?: Array<{ name?: string }> } }>;
+    };
+    const statusProp = data.properties?.["ステータス"];
+    const options = statusProp?.status?.options ?? [];
+    cachedStatusOptions = options.map((o) => o.name ?? "").filter((n) => n.length > 0);
+    console.log(`Status options loaded: ${cachedStatusOptions.join(", ")}`);
+    return cachedStatusOptions;
+  } catch (err) {
+    console.warn(`fetchTaskStatusOptions error: ${(err as Error).message}`);
+    return [];
+  }
+}
+
 /**
  * Recursively fetch all text content from a Notion project page (read-only).
  * Used as context for LLM when creating tasks.

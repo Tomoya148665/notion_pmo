@@ -13,6 +13,8 @@ interface PageUpdates {
   assignee?: string;
   /** Pre-resolved Notion user ID (from buildAssigneeResolver); takes precedence over assignee name lookup */
   assigneeId?: string;
+  /** 複数担当者の解決済み Notion user ID 配列。assigneeId より優先。 */
+  assigneeIds?: string[];
 }
 
 // ── Notion user ID mapping (name → ID) ─────────────────────────────────────
@@ -159,7 +161,10 @@ export async function updateTaskPage(
   if (updates.status !== undefined) {
     properties["ステータス"] = { status: { name: updates.status } };
   }
-  if (updates.assigneeId !== undefined) {
+  if (updates.assigneeIds !== undefined) {
+    // 複数担当者: 解決済み ID 配列をそのまま people にセット
+    properties["担当者"] = { people: updates.assigneeIds.map((id) => ({ id })) };
+  } else if (updates.assigneeId !== undefined) {
     // Pre-resolved ID from buildAssigneeResolver — use directly, skip all name lookup
     properties["担当者"] = { people: [{ id: updates.assigneeId }] };
   } else if (updates.assignee !== undefined) {
