@@ -1,6 +1,8 @@
 name = "notion-sprint-worker-dev"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+# @cloudflare/puppeteer が node:buffer 等を使うため必要
+compatibility_flags = ["nodejs_compat"]
 
 # Cloudflare アカウントを tomoya.kotetsu に固定する。
 # 別アカウントで `wrangler login` していると deploy がエラーになり、誤デプロイを防げる。
@@ -15,6 +17,10 @@ triggers = { crons = ["0 23 * * *", "30 23 * * *"] }
 
 [observability]
 enabled = true
+
+# Browser Rendering (Workers 有料プラン必須)。タイムライン画像をHTML/Tailwindで描画→スクショ。
+[browser]
+binding = "BROWSER"
 
 # 本番 KV namespace (NOTIFY_CACHE_DEV)。本番運用データはここに入っている。
 [[kv_namespaces]]

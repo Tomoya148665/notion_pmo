@@ -272,3 +272,49 @@ export async function authTest(
   };
 }
 
+/**
+ * 画像バイトを Slack にアップロードしてチャンネル/スレッドに表示する（files v2 フロー）。
+ * 必須スコープ: files:write
+ *  1) files.getUploadURLExternal でアップロードURL+file_idを取得
+ *  2) そのURLにバイトをPOST
+ *  3) files.completeUploadExternal でチャンネル/スレッドに添付
+ */
+export async function uploadImageToSlack(
+  token: string,
+  channelId: string,
+  threadTs: string | undefined,
+  filename: string,
+  bytes: Uint8Array,
+  initialComment?: string
+): Promise<void> {
+  // 1) upload URL
+  const r1 = await fetch("https://slack.com/api/files.getUploadURLExternal", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ filename, length: String(bytes.byteLength) }).toString()
+  });
+  const j1 = (await r1.json()) as { ok: boolean; error?: string; upload_url?: string; file_id?: string };
+  if (!j1.ok || !j1.upload_url || !j1.file_id) {
+    throw new Error(`files.getUploadURLExternal failed: ${j1.error ?? "unknown"}`);
+  }
+
+  // 2) PUT bytes to the upload URL（Workers ランタイムは Uint8Array をそのまま body にできる）
+  const r2 = await fetch(j1.upload_url, { method: "POST", body: bytes as unknown as BodyInit });
+  if (!r2.ok) throw new Error(`file bytes upload failed: ${r2.status}`);
+
+  // 3) complete
+  const completeBody: Record<string, unknown> = {
+    files: [{ id: j1.file_id, title: filename }],
+    channel_id: channelId
+  };
+  if (threadTs) completeBody.thread_ts = threadTs;
+  if (initialComment) completeBody.initial_comment = initialComment;
+  const r3 = await fetch("https://slack.com/api/files.completeUploadExternal", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(completeBody)
+  });
+  const j3 = (await r3.json()) as { ok: boolean; error?: string };
+  if (!j3.ok) throw new Error(`files.completeUploadExternal failed: ${j3.error ?? "unknown"}`);
+}
+

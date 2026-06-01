@@ -286,6 +286,28 @@ export function resolveSlackUserIdByName(
 }
 
 /**
+ * Notion 担当者名（表記揺れあり）→ カタログのメンバーを引く（別名照合）。
+ * メンバーDB上の短い名前(苗字)を得る用途。
+ */
+export function resolveMemberByName(
+  users: CachedUser[],
+  rawName: string
+): CachedUser | null {
+  const norm = normalizeName(rawName);
+  if (!norm || norm.length < 2) return null;
+  for (const u of users) {
+    if (u.aliases.some((a) => normalizeName(a) === norm)) return u;
+  }
+  for (const u of users) {
+    for (const alias of u.aliases) {
+      const a = normalizeName(alias);
+      if (a.length >= 2 && (a.includes(norm) || norm.includes(a))) return u;
+    }
+  }
+  return null;
+}
+
+/**
  * Slack ユーザー ID からカタログのメンバーを引く（@メンション解決用）。
  */
 export function resolveMemberBySlackId(

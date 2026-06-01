@@ -20,8 +20,11 @@ import {
   fetchCurrentSprintTasksSummary,
   fetchSprintCapacity,
   fetchTasksByDueRange,
+  fetchAllSprints,
+  fetchSprintBurndownTasks,
   isCompletedStatus
 } from "./notionApi";
+import { buildBurndownSeries, buildBurndownPng, renderBurndownHtml } from "./burndown";
 import { handleSlackEvents } from "./slackEvents";
 import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons, buildReminderDeliveryButtons } from "./slackInteractions";
 import { fetchMembers } from "./memberApi";
@@ -31,9 +34,11 @@ import {
   interpretRepliesAndPropose,
   matchTasksToSchedule
 } from "./llmAnalyzer";
-import { chatPostMessage, conversationsOpen } from "./slackBot";
+import { chatPostMessage, conversationsOpen, uploadImageToSlack } from "./slackBot";
 import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
-import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName } from "./userCatalog";
+import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName, resolveMemberByName } from "./userCatalog";
+import { buildTimelinePng, renderTimelineHtml } from "./timeline";
+import { captureAssigneeBoards, captureNotionTimeline, getNotionSession, DEFAULT_NOTION_BOARD_URL, DEFAULT_NOTION_TIMELINE_URL } from "./notionBoard";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -112,7 +117,9 @@ function formatShortDate(dateStr: string): string {
 
 // Known project abbreviation overrides (Japanese names etc. that can't be auto-abbreviated)
 const PROJECT_ABBREVIATION_OVERRIDES: ReadonlyMap<string, string> = new Map([
-  ["三井住友海上", "ms"],
+  ["三井住友海上", "MS"],
+  ["川崎設備", "川設"],
+  ["新菱冷熱工業", "新菱"],
 ]);
 const projectAbbrCache = new Map<string, string>();
 function abbreviateProject(name: string): string {
@@ -1075,6 +1082,57 @@ async function runTaskReminderFlow(
       threadTs
     );
 
+    // 2.5 Notion 実ビューのスクショ（A方式: KVのセッションCookieでログイン）
+    //   ① タイムラインビュー(ガントチャート) ② 担当者ごとのボードを切り出し
+    //   KV に Notion セッションが無い場合はスキップ（warn のみ）。
+    //   投稿順: タイムライン → 担当者ボード4枚（この後に「3.各担当者タスク」が続く）
+    try {
+      const session = await getNotionSession(env.NOTIFY_CACHE);
+      if (session) {
+        // ① Notion タイムラインビュー
+        try {
+          const tlUrl = env.NOTION_TIMELINE_VIEW_URL || DEFAULT_NOTION_TIMELINE_URL;
+          const tlPng = await captureNotionTimeline(env.BROWSER, session, tlUrl);
+          if (tlPng) {
+            await uploadImageToSlack(
+              config.slackBotToken,
+              channel,
+              threadTs,
+              `notion-timeline-${today}.png`,
+              tlPng,
+              "【タイムライン】"
+            );
+            // 画像はSlack側で表示確定が遅延するため、次の投稿前に待機して順序を保つ
+            await new Promise((r) => setTimeout(r, 2500));
+            console.log("Task reminder: posted Notion timeline screenshot");
+          }
+        } catch (err) {
+          console.warn(`Task reminder: Notion timeline image failed: ${(err as Error).message}`);
+        }
+
+        // ② 担当者ごとのボード
+        const boardUrl = env.NOTION_BOARD_VIEW_URL || DEFAULT_NOTION_BOARD_URL;
+        const boards = await captureAssigneeBoards(env.BROWSER, session, boardUrl);
+        for (const b of boards) {
+          await uploadImageToSlack(
+            config.slackBotToken,
+            channel,
+            threadTs,
+            `board-${b.key}-${today}.png`,
+            b.png,
+            `【${b.name}さんのタスクボード】`
+          );
+          // 画像の表示順を確定させるため待機（テキストが先に割り込むのを防ぐ）
+          await new Promise((r) => setTimeout(r, 2500));
+        }
+        console.log(`Task reminder: posted ${boards.length} assignee board images`);
+      } else {
+        console.log("Task reminder: no Notion session in KV (notion:session) — skipping Notion screenshots");
+      }
+    } catch (err) {
+      console.warn(`Task reminder: Notion screenshots failed: ${(err as Error).message}`);
+    }
+
     // 3. 各自のタスク状況（スレッド内・1人1メッセージ・個別メンション）
     let sent = 0;
     for (const { assigneeName, tableText } of memberTables) {
@@ -1919,10 +1977,95 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
             taskCount: a.tasks.filter((t) => !isCompletedStatus(t.status)).length
           };
         });
-      return jsonResponse({ today, nowUtc: now.toISOString(), dueWindow: { start: dueStart, end: dueEnd }, assignees });
+      // 生の日付プロパティをダンプ（実行日→期日のレンジがどのプロパティかを特定）
+      let rawDates: unknown = null;
+      if (config.taskDbId) {
+        const r = await fetch(`https://api.notion.com/v1/databases/${config.taskDbId}/query`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.notionToken}`, "Notion-Version": "2022-06-28", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filter: { and: [{ property: "期限", date: { on_or_after: dueStart } }, { property: "期限", date: { on_or_before: dueEnd } }] },
+            page_size: 6
+          })
+        }).catch(() => null);
+        if (r && r.ok) {
+          const j = (await r.json()) as { results?: Array<{ properties?: Record<string, any> }> };
+          rawDates = (j.results ?? []).map((p) => {
+            const props = p.properties ?? {};
+            const titleProp = Object.values(props).find((v: any) => v?.type === "title") as any;
+            const title = (titleProp?.title ?? []).map((t: any) => t.plain_text ?? "").join("");
+            const dates = Object.entries(props)
+              .filter(([, v]: [string, any]) => v?.type === "date")
+              .map(([name, v]: [string, any]) => ({ name, start: v.date?.start ?? null, end: v.date?.end ?? null }));
+            return { title, dates };
+          });
+        }
+      }
+      // タイムライン用タスク（苗字化）
+      const tlTasks = dueRange.assignees
+        .filter((a) => a.name !== "未割当")
+        .flatMap((a) => {
+          const member = resolveMemberByName(userCatalog, a.name);
+          const surname = member?.name ?? a.name.split(/[｜|/／\s]/)[0];
+          return a.tasks.filter((t) => !isCompletedStatus(t.status) && t.due).map((t) => ({
+            name: t.name, assignee: surname, status: t.status ?? "",
+            project: t.projectName ? abbreviateProject(t.projectName) : "",
+            start: t.startDate ?? (t.due as string), end: t.dueEnd ?? (t.due as string), sp: t.sp ?? null
+          }));
+        });
+      // ?debug=html → タイムラインのHTMLをそのまま返す（ローカルで見た目確認用）
+      if (url.searchParams.get("debug") === "html") {
+        return new Response(renderTimelineHtml(tlTasks, dueStart, dueEnd, today), {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+      }
+      // ?debug=png → Browser Rendering で描画したスクショPNGを返す（Slack投稿せず確認用）
+      if (url.searchParams.get("debug") === "png") {
+        const png = await buildTimelinePng(env.BROWSER, tlTasks, dueStart, dueEnd, today);
+        if (!png) return jsonResponse({ ok: false, error: "timeline png failed (BROWSER unbound?)" }, 500);
+        return new Response(png as unknown as BodyInit, { headers: { "Content-Type": "image/png" } });
+      }
+      return jsonResponse({ today, nowUtc: now.toISOString(), dueWindow: { start: dueStart, end: dueEnd }, taskCount: tlTasks.length, assignees, rawDates });
     }
     const result = await runTaskReminderFlow(env, "manual");
     return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  if (path === "/pmo/burndown") {
+    // ?sprint=s16 で指定。未指定なら現スプリント(期間内 or 進行中)。
+    const config = getConfig(env);
+    const now = new Date();
+    const today = toJstDateString(now);
+    const wantName = url.searchParams.get("sprint");
+    const sprints = await fetchAllSprints(config).catch(() => []);
+    const norm = (s: string) => s.toLowerCase().replace(/[\s　_-]/g, "");
+    const sprint = wantName
+      ? sprints.find((s) => norm(s.name) === norm(wantName))
+      : sprints.find((s) => s.start_date <= today && today <= s.end_date) ??
+        sprints.find((s) => /進行中|active|in progress/i.test(s.status));
+    if (!sprint) return jsonResponse({ ok: false, error: `sprint not found: ${wantName ?? "(current)"}` }, 404);
+
+    const tasks = await fetchSprintBurndownTasks(config, sprint.id);
+    const series = buildBurndownSeries(sprint.name, sprint.start_date, sprint.end_date, tasks, today);
+
+    if (url.searchParams.get("debug") === "1") {
+      return jsonResponse({ ok: true, sprint: sprint.name, taskCount: tasks.length, series });
+    }
+    if (url.searchParams.get("debug") === "html") {
+      return new Response(renderBurndownHtml(series), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (url.searchParams.get("debug") === "png") {
+      const png = await buildBurndownPng(env.BROWSER, series);
+      if (!png) return jsonResponse({ ok: false, error: "burndown png failed" }, 500);
+      return new Response(png as unknown as BodyInit, { headers: { "Content-Type": "image/png" } });
+    }
+
+    const channel = config.slackPmoChannelId;
+    if (!config.slackBotToken || !channel) return jsonResponse({ ok: false, error: "no bot token / channel" }, 400);
+    const png = await buildBurndownPng(env.BROWSER, series);
+    if (!png) return jsonResponse({ ok: false, error: "burndown png failed" }, 500);
+    await uploadImageToSlack(config.slackBotToken, channel, undefined, `burndown-${sprint.name}.png`, png, `【バーンダウン】 ${sprint.name}`);
+    return jsonResponse({ ok: true, sprint: sprint.name, total: series.total, taskCount: tasks.length });
   }
 
   if (path === "/pmo/reminder") {

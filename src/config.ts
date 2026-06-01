@@ -35,6 +35,12 @@ export interface Bindings {
   DRY_RUN?: string;
   REQUIRE_APPROVAL?: string;
   NOTIFY_CACHE: KVNamespace;
+  // Browser Rendering binding (Workers 有料プラン)。未バインド環境では undefined。
+  BROWSER?: Fetcher;
+  // Notion ボードビュー(担当者別タスクボード)の URL。未設定なら notionBoard.ts の既定 URL。
+  NOTION_BOARD_VIEW_URL?: string;
+  // Notion タイムラインビュー(ガントチャート)の URL。未設定なら notionBoard.ts の既定 URL。
+  NOTION_TIMELINE_VIEW_URL?: string;
 }
 
 export interface AppConfig {

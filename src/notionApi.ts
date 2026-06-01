@@ -310,6 +310,7 @@ interface TaskRow {
   priority: string | null;
   sp: number | null;
   due: string | null;
+  dueEnd: string | null;
   startDate: string | null;
   category: string | null;
   subItem: string | null;
@@ -464,6 +465,8 @@ const extractTaskRow = (page: any): TaskRow | null => {
   const dueProp = getPropertyByName(props, ["期限", "Due", "Due Date"]);
   const dueDate = getDateValue(dueProp);
   const due = normalizeDateString(dueDate?.start ?? dueDate?.end) ?? null;
+  // 期限がレンジ(開始〜終了)の場合の終端 = 期日。単日なら null。
+  const dueEnd = normalizeDateString(dueDate?.end) ?? null;
 
   const assignees = getPeopleNames(assigneeProp);
 
@@ -476,7 +479,8 @@ const extractTaskRow = (page: any): TaskRow | null => {
   const companyProp = getPropertyByName(props, ["実施社", "Company"]);
   const company = getStatusName(companyProp) ?? null;
 
-  const startDateProp = getPropertyByName(props, ["開始日", "Start Date"]);
+  // 開始(実行)日: このDBは「実行日」を使う。互換のため「開始日/Start Date」もフォールバック。
+  const startDateProp = getPropertyByName(props, ["実行日", "開始日", "Start Date"]);
   const startDateValue = getDateValue(startDateProp);
   const startDate = normalizeDateString(startDateValue?.start) ?? null;
 
@@ -496,6 +500,7 @@ const extractTaskRow = (page: any): TaskRow | null => {
     priority,
     sp,
     due,
+    dueEnd,
     startDate,
     category,
     subItem,
@@ -551,6 +556,7 @@ const groupTasksByAssignee = (
         priority: task.priority ?? null,
         sp: task.sp ?? null,
         due: task.due ?? null,
+        dueEnd: task.dueEnd ?? null,
         startDate: task.startDate ?? null,
         category: task.category ?? null,
         subItem: task.subItem ?? null,
@@ -757,6 +763,42 @@ export async function fetchTasksByDueRange(
 
   console.log(`fetchTasksByDueRange: ${tasks.length} tasks in ${startDate}~${endDate} across ${assignees.length} assignees`);
   return { assignees };
+}
+
+/**
+ * バーンダウン用: 指定スプリントの全タスク（完了含む）から SP・ステータス・完了日・期限 を取得する。
+ * extractTaskRow は完了タスクを除外するため、ここでは専用に抽出する。
+ */
+export async function fetchSprintBurndownTasks(
+  config: AppConfig,
+  sprintId: string
+): Promise<Array<{ sp: number; status: string | null; completedDate: string | null; due: string | null }>> {
+  const taskDbId = await resolveDatabaseId(config, {
+    url: config.taskDbUrl,
+    name: config.taskDbName,
+    label: "TASK_DB"
+  });
+  const pages = await queryDatabase(
+    config,
+    taskDbId,
+    { filter: { property: config.taskSprintRelationProperty, relation: { contains: sprintId } } },
+    10
+  );
+  return pages.map((page: any) => {
+    const props = page?.properties ?? {};
+    const statusProp =
+      getPropertyByName(props, ["ステータス", "Status", "状態"]) ||
+      findPropertiesByType(props, "status")[0]?.value;
+    const status = getStatusName(statusProp) ?? null;
+    const sp =
+      asNumber(props?.SP) ?? asNumber(props?.ポイント) ?? asNumber(props?.["Story Points"]) ?? 0;
+    const doneProp = getPropertyByName(props, ["完了日", "Completed Date", "完了"]);
+    const completedDate = normalizeDateString(getDateValue(doneProp)?.start) ?? null;
+    const dueProp = getPropertyByName(props, ["期限", "Due", "Due Date"]);
+    const dueVal = getDateValue(dueProp);
+    const due = normalizeDateString(dueVal?.start ?? dueVal?.end) ?? null;
+    return { sp: sp ?? 0, status, completedDate, due };
+  });
 }
 
 interface MemberCapacity {
