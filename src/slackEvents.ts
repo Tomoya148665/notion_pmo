@@ -295,7 +295,8 @@ export async function sendCompletionNotification(
   const timestamp = `${month}/${day} ${hours}:${minutes}`;
 
   const prefix = dryRun ? "（DRY_RUN）" : "";
-  const text = `${prefix}✅ Notion更新完了（${timestamp}）\n\n更新内容:\n${results.join("\n")}`;
+  // 更新系の完了通知は 🔄。ステータスの before/after(↗️/↘️) は Notion webhook 側で別途通知。
+  const text = `${prefix}:arrows_counterclockwise: タスクが更新されました（${timestamp}）\n\n${results.join("\n")}`;
 
   // threadTs があれば当日の MM/DD_タスクスレッドに投稿（チャンネルへの直接投稿を避ける）
   await chatPostMessage(botToken, channel, text, undefined, threadTs);
@@ -455,8 +456,16 @@ export async function executeNotionActions(
 
     try {
       await updateTaskPage(token, action.page_id, updates);
+      // ステータス変更は Notion webhook 側で before/after(↗️/↘️)を通知するため、
+      // 🔄 の完了通知(results)には含めない（二重通知を避ける）。
+      if (action.action === "update_status") {
+        console.log(`update_status ${action.task_name} → ${action.new_value}（completionには出さずwebhookに委譲）`);
+        continue;
+      }
       const link = notionPageUrl(action.page_id);
-      results.push(`・<${link}|${action.task_name}>: ${action.action} → ${action.new_value}`);
+      const label =
+        action.action === "update_due" ? "期限変更" : action.action === "update_sp" ? "SP変更" : action.action;
+      results.push(`・<${link}|${action.task_name}>: ${label} → ${action.new_value}`);
     } catch (err) {
       console.error(`Failed to update task ${action.page_id}`, (err as Error).message);
       results.push(`・${action.task_name}: 更新失敗 (${(err as Error).message})`);

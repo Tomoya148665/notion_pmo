@@ -16,7 +16,8 @@ import {
   getPhoneReminder,
   deletePhoneReminder,
   appendThreadCreatedTasks,
-  getCurrentTaskThread
+  getCurrentTaskThread,
+  saveTaskSnapshot
 } from "./workflow";
 import {
   executeNotionActions,
@@ -26,6 +27,7 @@ import {
 import { ensureUserCatalog, makeAssigneeResolver, type AssigneeResolver } from "./userCatalog";
 import { interpretPmReply } from "./llmAnalyzer";
 import { fetchNotionUserMap, buildUserMapFromDatabase, appendPageContent, appendLinksToPage } from "./notionWriter";
+import { fetchTaskPropertiesById } from "./notionApi";
 import type { AllocationProposal, NewTask } from "./schema";
 
 // ── HMAC-SHA256 signature verification (same as slackEvents) ───────────────
@@ -433,10 +435,6 @@ async function handleTaskActionButton(
     );
 
     const allResults = taskResults.map((r) => r.result.message);
-    const notificationLines = taskResults.map(
-      (r) =>
-        `・タスク追加: ${r.newTask.task_name}（担当: ${r.newTask.assignee}、期限: ${r.newTask.due}、SP: ${r.newTask.sp}）`
-    );
 
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
     if (pending.threadTs) {
@@ -465,11 +463,39 @@ async function handleTaskActionButton(
       ]
     );
 
-    // 完了通知は当日の MM/DD_タスクスレッドに入れる（チャンネルへの直接投稿を避ける）
+    // タスク追加通知（当日スレッドに「✅ {担当者}のタスクが追加されました」）
     const pmoChannel = config.slackPmoChannelId;
     if (pmoChannel && !config.dryRun) {
       const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
-      await sendCompletionNotification(config.slackBotToken, pmoChannel, notificationLines, false, taskThread ?? undefined);
+      const assignees = [...new Set(taskResults.map((r) => r.newTask.assignee))];
+      const assigneeLabel = assignees.length === 1 ? `${assignees[0]}の` : "";
+      const lines = [`✅ ${assigneeLabel}タスクが追加されました`, ""];
+      for (const r of taskResults) {
+        const t = r.newTask;
+        const dueDisp = t.due ? t.due.slice(5, 10) : "-"; // YYYY-MM-DD → MM-DD
+        const proj = t.project ? t.project : "-";
+        lines.push(`- タスク：「${t.task_name}」（担当：${t.assignee}、Prj：${proj}、期限：${dueDisp}、SP：${t.sp}）`);
+      }
+      await chatPostMessage(config.slackBotToken, pmoChannel, lines.join("\n"), undefined, taskThread ?? undefined);
+
+      // 起票したタスクの snapshot を Notion 正式値で保存 → 以降の更新を webhook が当日スレッドに通知できる
+      if (taskThread) {
+        for (const r of taskResults) {
+          if (!r.result.pageId) continue;
+          const props = await fetchTaskPropertiesById(config, r.result.pageId).catch(() => null);
+          if (!props) continue;
+          await saveTaskSnapshot(env.NOTIFY_CACHE, r.result.pageId, {
+            threadTs: taskThread,
+            channel: pmoChannel,
+            taskName: props.name || r.newTask.task_name,
+            status: props.status,
+            assignees: props.assignees,
+            due: props.due,
+            sp: props.sp
+          }).catch(() => {});
+        }
+        console.log(`Saved snapshots for ${taskResults.length} newly created task(s)`);
+      }
     }
   } else {
     // Update actions (update_due, update_sp, update_status, update_assignee, etc.)
@@ -492,10 +518,9 @@ async function handleTaskActionButton(
       await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
     }
 
-    const summaryMsg =
-      results.length > 0
-        ? `✅ Notion更新完了\n\n更新内容:\n${results.join("\n")}`
-        : "✅ 更新する内容がありませんでした。";
+    // 更新内容は全て Notion webhook が当日スレッドに before/after 形式で通知するため、
+    // ここでは承認ボタンメッセージに「承認しました」と表示するだけ（重複通知を廃止）
+    const summaryMsg = "✅ 承認しました（変更内容はスレッドに通知されます）";
 
     await chatUpdate(
       config.slackBotToken,
@@ -507,12 +532,6 @@ async function handleTaskActionButton(
         textSection(`✅ <@${userId}> が承認しました\n\n${summaryMsg}`)
       ]
     );
-
-    const pmoChannel = config.slackPmoChannelId;
-    if (pmoChannel) {
-      const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
-      await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun, taskThread ?? undefined);
-    }
   }
 
   console.log(`Action approved by ${userId}: channel=${channel} ts=${messageTs}`);

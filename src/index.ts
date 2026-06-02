@@ -76,6 +76,8 @@ function isWideChar(code: number): boolean {
     (code >= 0x11a8 && code <= 0x11ff) ||
     // Enclosed Alphanumerics ①②③ etc.
     (code >= 0x2460 && code <= 0x24ff) ||
+    // Arrows ← → ↑ ↓ ⇒ etc.（Slack等幅では全角幅で表示される）
+    (code >= 0x2190 && code <= 0x21ff) ||
     // Box Drawing + Block Elements + Geometric Shapes ■□▲△○● etc.
     (code >= 0x2500 && code <= 0x25ff) ||
     // Miscellaneous Symbols + Dingbats ☆★☏ etc.
@@ -110,12 +112,10 @@ function getDisplayWidth(str: string): number {
 }
 
 function padEndCjk(str: string, targetWidth: number): string {
+  // \u534a\u89d2\u30b9\u30da\u30fc\u30b9\u306e\u307f\u3067\u57cb\u3081\u308b\u3002Slack \u306e\u7b49\u5e45\u30d5\u30a9\u30f3\u30c8\u3067\u306f\u5168\u89d2=2\u5e45 / \u534a\u89d2=1\u5e45\u3067\u5b89\u5b9a\u3059\u308b\u305f\u3081\u3001
+  // 1\u5e45\u5358\u4f4d\u3067\u8abf\u6574\u3067\u304d\u308b\u534a\u89d2\u30b9\u30da\u30fc\u30b9\u304c\u6700\u3082\u30ba\u30ec\u306a\u3044\uff08\u5168\u89d2\u30b9\u30da\u30fc\u30b9\u6df7\u5728\u306f\u7aef\u6570\u3067\u30ac\u30bf\u3064\u304f\uff09\u3002
   const diff = Math.max(0, targetWidth - getDisplayWidth(str));
-  // Use full-width space (U+3000) for padding to match CJK glyph width,
-  // preventing cumulative sub-pixel drift between CJK text and ASCII spaces.
-  const fwSpaces = Math.floor(diff / 2);
-  const hwRemainder = diff % 2;
-  return str + "\u3000".repeat(fwSpaces) + " ".repeat(hwRemainder);
+  return str + " ".repeat(diff);
 }
 
 function formatShortDate(dateStr: string): string {
@@ -1489,9 +1489,11 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   // 差分検出
   const changes: string[] = [];
   let statusChanged = false;
+  let progressArrow = ""; // 進捗SPの増減で矢印を変える（増→↗️ / 減→↘️）
   if (snapshot.status !== current.status) {
     statusChanged = true;
-    changes.push(`・ステータス：${snapshot.status ?? "なし"} → ${current.status ?? "なし"}`);
+    // ステータスは N% 表示（doing(60%) → 60%）
+    changes.push(`ステータス：${simplifyStatus(snapshot.status)} → ${simplifyStatus(current.status)}`);
     // 進捗SP: doing/完了 が関わるステータス変更のときだけ表示
     //   (backlog↔ready↔pending 等の変化では進捗SPは動かないので出さない)
     const sp = current.sp ?? snapshot.sp ?? 0;
@@ -1502,19 +1504,20 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
       const d = Math.round(sp * newRate * 10) / 10;
       const diff = Math.round((d - c) * 10) / 10;
       const sign = diff > 0 ? "+" : "";
-      changes.push(`・進捗SP：${c} → ${d}（${sign}${diff}）`);
+      changes.push(`進捗SP：${c} → ${d}（${sign}${diff}）`);
+      progressArrow = diff > 0 ? ":arrow_upper_right:" : diff < 0 ? ":arrow_lower_right:" : "";
     }
   }
   const prevA = [...snapshot.assignees].sort().join("、");
   const curA = [...current.assignees].sort().join("、");
   if (prevA !== curA) {
-    changes.push(`・担当者：${prevA || "なし"} → ${curA || "なし"}`);
+    changes.push(`担当者変更：${prevA || "なし"} → ${curA || "なし"}`);
   }
   if ((snapshot.due ?? null) !== (current.due ?? null)) {
-    changes.push(`・期限：${snapshot.due ?? "なし"} → ${current.due ?? "なし"}`);
+    changes.push(`期限変更：${snapshot.due ?? "なし"} → ${current.due ?? "なし"}`);
   }
   if ((snapshot.sp ?? null) !== (current.sp ?? null)) {
-    changes.push(`・SP：${snapshot.sp ?? "なし"} → ${current.sp ?? "なし"}`);
+    changes.push(`SP変更：${snapshot.sp ?? "なし"} → ${current.sp ?? "なし"}`);
   }
 
   if (changes.length === 0) {
@@ -1529,10 +1532,12 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
 
   const taskName = current.name || snapshot.taskName;
   const assigneeLabel = current.assignees.length > 0 ? current.assignees.join("、") : "担当者未設定";
-  const header = statusChanged
-    ? `${assigneeLabel}のタスク「${taskName}」のステータスが更新されました。`
-    : `${assigneeLabel}のタスク「${taskName}」が更新されました。`;
-  const msg = `${header}\n${changes.join("\n")}`;
+  // アイコン: ステータス変更時は進捗の増減で矢印、それ以外は🔄
+  const icon = statusChanged ? (progressArrow || ":arrow_right:") : ":arrows_counterclockwise:";
+  const title = statusChanged
+    ? `${icon}  ${assigneeLabel}のタスク「${taskName}」のステータスが更新されました。`
+    : `${icon}  ${assigneeLabel}のタスク「${taskName}」が更新されました。`;
+  const msg = `${title}\n\n${changes.join("\n")}`;
   await chatPostMessage(config.slackBotToken, snapshot.channel, msg, undefined, snapshot.threadTs);
   console.log(`Notion webhook: notified thread ${snapshot.threadTs} — ${changes.join(" / ")}`);
 
