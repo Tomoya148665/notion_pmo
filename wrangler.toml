@@ -12,8 +12,11 @@ account_id = "43ac0fa6a0cf47be7839e6178a2588d0"
 # 例: "10,20,30,40,50 0 * * *" は 5 トリガーとして数えられる点に注意。
 # 現在は 08:00 JST と 08:30 JST(タスクリマインド) の 2 個。定期通知(担当者通知/PMレポート/
 # リマインド)をフル稼働させる場合は cron を展開後 5 個以内に収めて追加すること。
-# "30 23 * * *" = 08:30 JST タスクリマインド(runTaskReminderFlow)
-triggers = { crons = ["0 23 * * *", "30 23 * * *"] }
+# "30 23 * * *" = 08:30 JST タスクリマインド(runTaskReminderFlow / full)
+# "0 5 * * *"   = 14:00 JST タスク状況の追記リマインド(runTaskReminderFlow / midday)
+# "0 11 * * *"  = 20:00 JST タスク状況の追記リマインド(runTaskReminderFlow / evening)
+# "0 15 * * *"  = 24:00 JST(翌0時) 本日の進捗サマリー(runDailyProgressSummary)
+triggers = { crons = ["0 23 * * *", "30 23 * * *", "0 5 * * *", "0 11 * * *", "0 15 * * *"] }
 
 [observability]
 enabled = true

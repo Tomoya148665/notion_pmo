@@ -1059,6 +1059,42 @@ export async function fetchTaskStatusOptions(config: AppConfig): Promise<string[
   }
 }
 
+export interface TaskProperties {
+  name: string;
+  status: string | null;
+  assignees: string[];
+  due: string | null;
+  sp: number | null;
+}
+
+/** 単一ページの主要プロパティ（名前・ステータス・担当者・期限・SP）を取得。Notion webhook の変更検出用。 */
+export async function fetchTaskPropertiesById(
+  config: AppConfig,
+  pageId: string
+): Promise<TaskProperties | null> {
+  try {
+    const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+      headers: {
+        Authorization: `Bearer ${config.notionToken}`,
+        "Notion-Version": NOTION_VERSION,
+      },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { properties?: Record<string, any> };
+    const props = data.properties ?? {};
+    const name = getTitleFromProperties(props, ["名前", "Name", "name"]);
+    const status = getStatusName(getPropertyByName(props, ["ステータス", "Status"])) ?? null;
+    const assignees = getPeopleNames(getPropertyByName(props, ["担当者", "Assignee"]));
+    const dateVal = getDateValue(getPropertyByName(props, ["期限", "Due", "期間"]));
+    const due = dateVal?.start ?? null;
+    const sp = asNumber(getPropertyByName(props, ["SP", "sp"]));
+    return { name, status, assignees, due, sp };
+  } catch (err) {
+    console.warn(`fetchTaskPropertiesById error: ${(err as Error).message}`);
+    return null;
+  }
+}
+
 /**
  * Recursively fetch all text content from a Notion project page (read-only).
  * Used as context for LLM when creating tasks.

@@ -15,7 +15,8 @@ import {
   savePhoneReminder,
   getPhoneReminder,
   deletePhoneReminder,
-  appendThreadCreatedTasks
+  appendThreadCreatedTasks,
+  getCurrentTaskThread
 } from "./workflow";
 import {
   executeNotionActions,
@@ -464,10 +465,11 @@ async function handleTaskActionButton(
       ]
     );
 
-    // Channel-wide completion notification
+    // 完了通知は当日の MM/DD_タスクスレッドに入れる（チャンネルへの直接投稿を避ける）
     const pmoChannel = config.slackPmoChannelId;
     if (pmoChannel && !config.dryRun) {
-      await sendCompletionNotification(config.slackBotToken, pmoChannel, notificationLines, false);
+      const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
+      await sendCompletionNotification(config.slackBotToken, pmoChannel, notificationLines, false, taskThread ?? undefined);
     }
   } else {
     // Update actions (update_due, update_sp, update_status, update_assignee, etc.)
@@ -508,7 +510,8 @@ async function handleTaskActionButton(
 
     const pmoChannel = config.slackPmoChannelId;
     if (pmoChannel) {
-      await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun);
+      const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
+      await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun, taskThread ?? undefined);
     }
   }
 
@@ -647,10 +650,11 @@ async function handlePmReportButton(
     messageTs
   );
 
-  // Channel-wide completion notification
+  // 完了通知は当日の MM/DD_タスクスレッドに入れる
   const pmoChannel = config.slackPmoChannelId;
   if (pmoChannel) {
-    await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun);
+    const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
+    await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun, taskThread ?? undefined);
   }
 
   console.log(`PM report approved by ${userId}`);

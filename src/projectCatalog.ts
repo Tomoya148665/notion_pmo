@@ -17,8 +17,10 @@ export interface ProjectCacheEntry {
   refreshedAt: string;
 }
 
+// NFKC で全角→半角統一（（）→() 等）し、括弧・記号・空白を除去して比較に使う。
+// 例: "新菱冷熱工業（RAG)"(半角閉じ) と "新菱冷熱工業（RAG）"(全角閉じ) を同一視する。
 const normalize = (s: string): string =>
-  s.trim().toLowerCase().replace(/[\s　]+/g, "");
+  s.normalize("NFKC").toLowerCase().replace(/[\s()[\]{}「」『』【】・,，.。、]/g, "");
 
 export async function crawlTeamProjects(
   notionToken: string,
@@ -122,6 +124,43 @@ export async function saveCachedProjects(
  * キャッシュ済みプロジェクト一覧から、与えられた名前にもっとも近い1件を返す。
  * 揺らぎ許容: 正規化(trim/lowercase/空白除去)後の完全一致 → 部分一致(名前長差最小)。
  */
+// ── 略称エイリアス（ユーザーが番号選択で確定した「略称→プロジェクト」を記録して再利用）──
+const PROJECT_ALIAS_KEY = (alias: string) => `project-alias:${normalize(alias)}`;
+const ALIAS_TTL = 180 * 24 * 3600; // 半年
+
+/** 略称→プロジェクトID/名 の対応を記録（番号選択で確定したとき呼ぶ）。 */
+export async function saveProjectAlias(
+  kv: KVNamespace,
+  alias: string,
+  project: CachedProject
+): Promise<void> {
+  const n = normalize(alias);
+  if (!n) return;
+  await kv
+    .put(PROJECT_ALIAS_KEY(alias), JSON.stringify({ id: project.id, name: project.name }), {
+      expirationTtl: ALIAS_TTL,
+    })
+    .catch(() => {});
+}
+
+/** 記録済みの略称エイリアスからプロジェクトを引く。未登録なら null。 */
+export async function resolveProjectByAlias(
+  kv: KVNamespace,
+  alias: string,
+  projects: CachedProject[]
+): Promise<CachedProject | null> {
+  const n = normalize(alias);
+  if (!n) return null;
+  const raw = await kv.get(PROJECT_ALIAS_KEY(alias)).catch(() => null);
+  if (!raw) return null;
+  try {
+    const { id } = JSON.parse(raw) as { id: string; name: string };
+    return projects.find((p) => p.id === id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function resolveProjectFromCache(
   projects: CachedProject[],
   name: string
@@ -145,12 +184,31 @@ export function resolveProjectFromCache(
   }
 
   if (exact) return exact;
-  if (partial.length === 0) return null;
+  if (partial.length > 0) {
+    partial.sort(
+      (a, b) => Math.abs(a.name.length - name.length) - Math.abs(b.name.length - name.length)
+    );
+    return partial[0];
+  }
 
-  partial.sort(
-    (a, b) => Math.abs(a.name.length - name.length) - Math.abs(b.name.length - name.length)
-  );
-  return partial[0];
+  // 大雑把マッチ: 部分一致が無くても、クエリの文字がどれだけ候補名に含まれるかで最も近いものを返す。
+  // プロジェクト候補は少数なので緩め（クエリ文字の60%以上が含まれれば採用）。
+  //   例: "新菱RAG" → "新菱冷熱工業（RAG）"(新菱/r/a/g 全部含む=1.0) を採用、"新菱冷熱工業（積算）"(0.4) は不採用。
+  let best: CachedProject | null = null;
+  let bestScore = 0;
+  for (const p of projects) {
+    const nName = normalize(p.name);
+    if (!nName) continue;
+    let hit = 0;
+    for (const ch of nQuery) if (nName.includes(ch)) hit++;
+    const score = hit / nQuery.length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  if (best && bestScore >= 0.6) return best;
+  return null;
 }
 
 /**

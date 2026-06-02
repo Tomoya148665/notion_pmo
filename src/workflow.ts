@@ -255,6 +255,8 @@ export interface PendingProjectSelection {
   requestedBy: string;
   requestedAt: string;
   fallbackProjectIds: string[];
+  /** ユーザーが入力した元の略称（番号選択で確定したらエイリアスとして記録する） */
+  query?: string;
 }
 
 const PROJECT_SELECTION_KEY = (channel: string, threadTs: string) =>
@@ -372,6 +374,93 @@ export async function getThreadCreatedTasks(
     return Array.isArray(parsed) ? (parsed as ThreadCreatedTask[]) : [];
   } catch {
     return [];
+  }
+}
+
+// ── タスクのプロパティ・スナップショット (Notion webhook での変更検出用) ───
+//   page_id ごとに「どのスレッドに紐づくか」と「最後に観測したプロパティ値」を保存。
+//   Notion webhook 受信時、現在値とスナップショットを比較して変化を検出し、
+//   threadTs のスレッドに通知する。
+export interface TaskSnapshot {
+  threadTs: string;
+  channel: string;
+  taskName: string;
+  status: string | null;
+  assignees: string[];
+  due: string | null;
+  sp: number | null;
+}
+
+const TASK_SNAPSHOT_KEY = (pageId: string) => `task-snapshot:${pageId.replace(/-/g, "")}`;
+// 当日スレッド + 翌朝まで通知できるよう 2 日保持
+const SNAPSHOT_TTL = 2 * 24 * 3600;
+
+export async function saveTaskSnapshot(
+  kv: KVNamespace,
+  pageId: string,
+  snapshot: TaskSnapshot
+): Promise<void> {
+  await kv.put(TASK_SNAPSHOT_KEY(pageId), JSON.stringify(snapshot), { expirationTtl: SNAPSHOT_TTL });
+}
+
+export async function getTaskSnapshot(
+  kv: KVNamespace,
+  pageId: string
+): Promise<TaskSnapshot | null> {
+  const raw = await kv.get(TASK_SNAPSHOT_KEY(pageId)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as TaskSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+// 当日の「MM/DD_タスク」スレッドの threadTs（完了通知をチャンネルでなくこのスレッドに入れる用）
+const CURRENT_TASK_THREAD_KEY = (channel: string) => `current-task-thread:${channel}`;
+
+export async function saveCurrentTaskThread(
+  kv: KVNamespace,
+  channel: string,
+  threadTs: string
+): Promise<void> {
+  await kv.put(CURRENT_TASK_THREAD_KEY(channel), threadTs, { expirationTtl: SNAPSHOT_TTL });
+}
+
+export async function getCurrentTaskThread(
+  kv: KVNamespace,
+  channel: string
+): Promise<string | null> {
+  return (await kv.get(CURRENT_TASK_THREAD_KEY(channel)).catch(() => null)) || null;
+}
+
+// 当日の各タスクの「朝(8:30)の起点」プロパティ。24:00 サマリーで1日の進捗SP変動を出す用。
+export interface DayStartEntry {
+  status: string | null;
+  sp: number | null;
+  name: string;
+  assignees: string[];
+}
+const DAYSTART_KEY = (date: string) => `daystart-progress:${date}`;
+
+export async function saveDayStartProgress(
+  kv: KVNamespace,
+  date: string,
+  map: Record<string, DayStartEntry>
+): Promise<void> {
+  await kv.put(DAYSTART_KEY(date), JSON.stringify(map), { expirationTtl: 2 * 24 * 3600 });
+}
+
+export async function getDayStartProgress(
+  kv: KVNamespace,
+  date: string
+): Promise<Record<string, DayStartEntry>> {
+  const raw = await kv.get(DAYSTART_KEY(date)).catch(() => null);
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as Record<string, DayStartEntry>;
+  } catch {
+    return {};
   }
 }
 

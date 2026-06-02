@@ -22,7 +22,8 @@ import {
   fetchTasksByDueRange,
   fetchAllSprints,
   fetchSprintBurndownTasks,
-  isCompletedStatus
+  isCompletedStatus,
+  fetchTaskPropertiesById
 } from "./notionApi";
 import { buildBurndownSeries, buildBurndownPng, renderBurndownHtml } from "./burndown";
 import { handleSlackEvents } from "./slackEvents";
@@ -54,7 +55,14 @@ import {
   getCronHeartbeat,
   getAllCronHeartbeats,
   hasCronAlertBeenSent,
-  markCronAlertSent
+  markCronAlertSent,
+  saveTaskSnapshot,
+  getTaskSnapshot,
+  saveCurrentTaskThread,
+  getCurrentTaskThread,
+  saveDayStartProgress,
+  getDayStartProgress,
+  type DayStartEntry
 } from "./workflow";
 
 interface Env extends Bindings {}
@@ -137,12 +145,48 @@ function abbreviateProject(name: string): string {
   return abbr;
 }
 
-type TaskTableRow = { name: string; project: string; status: string; priority: string; sp: string; due: string };
+type TaskTableRow = { name: string; project: string; status: string; priority: string; sp: string; due: string; alert?: string };
+// 24時サマリー用（ステータス差分・進捗SP表示）
+type ProgressTableRow = { name: string; project: string; statusDiff: string; spText: string };
 
-/** タスク配列を等幅コードブロックの表に整形する（タスク名/プロジェクト/ステータス/優先度/SP/期限）。 */
+/** "doing(60%)" → "60%" に簡略化（doing 接頭辞を除去）。完了等はそのまま。 */
+function simplifyStatus(status: string | null | undefined): string {
+  if (!status) return "-";
+  return status.replace(/doing\((\d+)%\)/g, "$1%");
+}
+
+/**
+ * 期限と today（と送信タイミング reason）から行末アラート絵文字を返す。
+ *   期限超過      → 🔥🔥🔥（常時）
+ *   今日が期日    → 8:30:💪💪💪 / 14:00:🚨💪💪 / 20:00:🚨🚨💪（時刻が進むほど緊急）
+ *   明日が期日    → 💪💪💪
+ *   それ以外      → 空
+ */
+function deadlineAlert(
+  due: string | null | undefined,
+  today: string,
+  status?: string | null,
+  reason?: string
+): string {
+  if (!due) return "";
+  if (status && isCompletedStatus(status)) return "";
+  const dueDate = new Date(due.slice(0, 10) + "T00:00:00Z");
+  const todayDate = new Date(today + "T00:00:00Z");
+  const days = Math.ceil((dueDate.getTime() - todayDate.getTime()) / 86400000);
+  if (days < 0) return "🔥🔥🔥"; // 期限超過
+  if (days === 0) {
+    if (reason === "evening") return "🚨🚨💪"; // 20:00
+    if (reason === "midday") return "🚨💪💪"; // 14:00
+    return "💪💪💪"; // 8:30 / manual
+  }
+  if (days === 1) return "💪💪💪"; // 明日
+  return "";
+}
+
+/** 定期送信のタスク表（タスク名/プロジェクト/ステータス/優先度/SP/期限 + 期限アラート）。 */
 function renderTaskTable(tasks: TaskTableRow[]): string {
   const headers = ["タスク名", "プロジェクト", "ステータス", "優先度", "SP", "期限"];
-  const keys: (keyof TaskTableRow)[] = ["name", "project", "status", "priority", "sp", "due"];
+  const keys: Array<Exclude<keyof TaskTableRow, "alert">> = ["name", "project", "status", "priority", "sp", "due"];
   const colWidths = keys.map((k, i) =>
     Math.max(getDisplayWidth(headers[i]), ...tasks.map((t) => getDisplayWidth(t[k])))
   );
@@ -150,27 +194,64 @@ function renderTaskTable(tasks: TaskTableRow[]): string {
   lines.push(headers.map((h, i) => padEndCjk(h, colWidths[i])).join("  "));
   lines.push(colWidths.map((w) => "-".repeat(w)).join("  "));
   for (const task of tasks) {
-    lines.push(
-      keys
-        .map((k, i) => (i === keys.length - 1 ? task[k] : padEndCjk(task[k], colWidths[i])))
-        .join("  ")
-    );
+    const row = keys
+      .map((k, i) => (i === keys.length - 1 ? task[k] : padEndCjk(task[k], colWidths[i])))
+      .join("  ");
+    lines.push(task.alert ? `${row}  ${task.alert}` : row);
   }
   lines.push("```");
   return lines.join("\n");
 }
 
-/** Notion タスク1件を表示用の行に変換する。プロジェクトは専用カラムに表示する。 */
+/** 24時サマリー用のタスク表（タスク名/プロジェクト/ステータス差分/SP（進捗SP））。 */
+function renderProgressTable(rows: ProgressTableRow[]): string {
+  const headers = ["タスク名", "プロジェクト", "ステータス差分", "SP（進捗SP）"];
+  const keys: (keyof ProgressTableRow)[] = ["name", "project", "statusDiff", "spText"];
+  const colWidths = keys.map((k, i) =>
+    Math.max(getDisplayWidth(headers[i]), ...rows.map((t) => getDisplayWidth(t[k])))
+  );
+  const lines: string[] = ["```"];
+  lines.push(headers.map((h, i) => padEndCjk(h, colWidths[i])).join("  "));
+  lines.push(colWidths.map((w) => "-".repeat(w)).join("  "));
+  for (const r of rows) {
+    lines.push(keys.map((k, i) => (i === keys.length - 1 ? r[k] : padEndCjk(r[k], colWidths[i]))).join("  "));
+  }
+  lines.push("```");
+  return lines.join("\n");
+}
+
+/** 定期送信用: Notion タスク1件を表示行に変換（ステータスは doing(N%)→N% に簡略化）。 */
 function taskToTableRow(task: {
   name: string; status?: string | null; priority?: string | null; sp?: number | null; due?: string | null; projectName?: string | null;
-}): TaskTableRow {
+}, today?: string, reason?: string): TaskTableRow {
   return {
     name: task.name,
     project: task.projectName ? abbreviateProject(task.projectName) : "-",
-    status: task.status ?? "-",
+    status: simplifyStatus(task.status),
     priority: task.priority ?? "-",
     sp: task.sp != null ? String(task.sp) : "-",
-    due: task.due ? formatShortDate(task.due) : "-"
+    due: task.due ? formatShortDate(task.due) : "-",
+    alert: today ? deadlineAlert(task.due, today, task.status, reason) : ""
+  };
+}
+
+/** 24時サマリー用: 朝の起点と比較してステータス差分・進捗SP行を作る。 */
+function taskToProgressRow(
+  task: { name: string; status: string | null; sp: number | null; projectName: string | null },
+  dayStart: { status: string | null; sp: number | null }
+): ProgressTableRow {
+  const curStatus = simplifyStatus(task.status);
+  const startStatus = simplifyStatus(dayStart.status);
+  const statusDiff = startStatus !== curStatus ? `${startStatus} → ${curStatus}` : curStatus;
+  const sp = task.sp ?? dayStart.sp ?? 0;
+  const delta =
+    Math.round((sp * statusProgressRate(task.status) - sp * statusProgressRate(dayStart.status)) * 10) / 10;
+  const spText = delta > 0 ? `${task.sp ?? sp}（+${delta}）` : (task.sp != null ? String(task.sp) : "-");
+  return {
+    name: task.name,
+    project: task.projectName ? abbreviateProject(task.projectName) : "-",
+    statusDiff,
+    spText
   };
 }
 
@@ -300,14 +381,16 @@ function buildScheduleAnalysis(
  * 1人1メッセージで個別送信するため、{担当者名, テーブル文字列} の配列で返す。
  */
 function buildPerMemberTaskTables(
-  assignees: SprintTasksSummary["assignees"]
+  assignees: SprintTasksSummary["assignees"],
+  today?: string,
+  reason?: string
 ): Array<{ assigneeName: string; tableText: string }> {
   const result: Array<{ assigneeName: string; tableText: string }> = [];
   for (const assignee of assignees) {
     if (assignee.name === "未割当") continue; // 担当者なしのタスクはリマインド対象外
     const rows = assignee.tasks
       .filter((t) => !isCompletedStatus(t.status))
-      .map((t) => taskToTableRow(t));
+      .map((t) => taskToTableRow(t, today, reason));
     if (rows.length === 0) continue;
     result.push({ assigneeName: assignee.name, tableText: renderTaskTable(rows) });
   }
@@ -1059,7 +1142,8 @@ async function runTaskReminderFlow(
 
     // 各自のタスクはスプリント非依存: 期限が今日-3日〜今日+10日の未完了タスクを直接取得
     const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd);
-    const memberTables = buildPerMemberTaskTables(dueRange.assignees);
+    const isUpdate = reason === "midday" || reason === "evening";
+    const memberTables = buildPerMemberTaskTables(dueRange.assignees, today, reason);
 
     // メンション解決用: キャッシュ済みユーザーカタログ（別名で漢字/ローマ字の表記揺れを吸収）
     const userCatalog = await ensureUserCatalog(env, config).catch(() => []);
@@ -1069,25 +1153,52 @@ async function runTaskReminderFlow(
       return { ok: true, dryRun: true, members: memberTables.length };
     }
 
-    // 1. 親メッセージ
-    const parent = await chatPostMessage(config.slackBotToken, channel, `${dateLabel}_タスク`);
-    const threadTs = parent.ts;
-
-    // 2. スケジュール分析（スレッド内）
-    await chatPostMessage(
-      config.slackBotToken,
-      channel,
-      buildScheduleAnalysis(summary, avgDailySp, today),
-      undefined,
-      threadTs
-    );
+    // 1. スレッド決定:
+    //   full(8:30/manual) = 新規「MM/DD_タスク」親メッセージ + スケジュール分析
+    //   update(14:00/20:00) = 当日スレッドに「⏰ 時刻時点」見出しを追記（画像は朝の分を流用）
+    let threadTs: string;
+    if (isUpdate) {
+      const existing = await getCurrentTaskThread(env.NOTIFY_CACHE, channel);
+      if (existing) {
+        threadTs = existing;
+        const label = reason === "midday" ? "14:00" : "20:00";
+        await chatPostMessage(
+          config.slackBotToken,
+          channel,
+          `⏰ ${label} 時点のタスク状況（🔥=期限超過 / 💪=期限が今日か明日）`,
+          undefined,
+          threadTs
+        );
+      } else {
+        // 当日スレッドが無ければ新規作成にフォールバック
+        const parent = await chatPostMessage(config.slackBotToken, channel, `${dateLabel}_タスク`);
+        threadTs = parent.ts;
+        await saveCurrentTaskThread(env.NOTIFY_CACHE, channel, threadTs).catch(() => {});
+        await chatPostMessage(
+          config.slackBotToken,
+          channel,
+          buildScheduleAnalysis(summary, avgDailySp, today),
+          undefined,
+          threadTs
+        );
+      }
+    } else {
+      const parent = await chatPostMessage(config.slackBotToken, channel, `${dateLabel}_タスク`);
+      threadTs = parent.ts;
+      await chatPostMessage(
+        config.slackBotToken,
+        channel,
+        buildScheduleAnalysis(summary, avgDailySp, today),
+        undefined,
+        threadTs
+      );
+    }
 
     // 2.5 Notion 実ビューのスクショ（A方式: KVのセッションCookieでログイン）
     //   ① タイムラインビュー(ガントチャート) ② 担当者ごとのボードを切り出し
-    //   KV に Notion セッションが無い場合はスキップ（warn のみ）。
-    //   投稿順: タイムライン → 担当者ボード4枚（この後に「3.各担当者タスク」が続く）
+    //   full モードのみ（update=14:00/20:00 は朝の画像を流用し、テキストの状況だけ追記）
     try {
-      const session = await getNotionSession(env.NOTIFY_CACHE);
+      const session = isUpdate ? null : await getNotionSession(env.NOTIFY_CACHE);
       if (session) {
         // 担当者アバターの実URL(avatar_url)を API から取得しておく（白い丸対策）
         const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
@@ -1157,6 +1268,51 @@ async function runTaskReminderFlow(
       sent++;
     }
 
+    // Notion webhook の変更検出用スナップショット保存
+    //   page_id ごとに「このスレッド(threadTs)」と現在のプロパティ値を記録。
+    //   以降、Notion でプロパティが変わると webhook がこのスレッドに通知する。
+    const snapshotMap = new Map<string, { name: string; status: string | null; due: string | null; sp: number | null; assignees: string[] }>();
+    for (const a of dueRange.assignees) {
+      if (a.name === "未割当") continue;
+      for (const t of a.tasks) {
+        const ex = snapshotMap.get(t.id);
+        if (ex) {
+          if (!ex.assignees.includes(a.name)) ex.assignees.push(a.name);
+        } else {
+          snapshotMap.set(t.id, {
+            name: t.name,
+            status: t.status ?? null,
+            due: t.due ?? null,
+            sp: t.sp ?? null,
+            assignees: [a.name]
+          });
+        }
+      }
+    }
+    for (const [pageId, snap] of snapshotMap) {
+      await saveTaskSnapshot(env.NOTIFY_CACHE, pageId, {
+        threadTs,
+        channel,
+        taskName: snap.name,
+        status: snap.status,
+        assignees: snap.assignees,
+        due: snap.due,
+        sp: snap.sp
+      }).catch(() => {});
+    }
+    console.log(`Task reminder: saved ${snapshotMap.size} task snapshots for webhook diffing`);
+
+    // full モードのみ: 当日スレッドを記録 + 朝の進捗起点を保存（24:00 サマリー用）
+    if (!isUpdate) {
+      await saveCurrentTaskThread(env.NOTIFY_CACHE, channel, threadTs).catch(() => {});
+      const dayStart: Record<string, DayStartEntry> = {};
+      for (const [pageId, snap] of snapshotMap) {
+        dayStart[pageId] = { status: snap.status, sp: snap.sp, name: snap.name, assignees: snap.assignees };
+      }
+      await saveDayStartProgress(env.NOTIFY_CACHE, today, dayStart).catch(() => {});
+      console.log(`Task reminder: saved day-start progress for ${Object.keys(dayStart).length} tasks`);
+    }
+
     await saveCronHeartbeat(env.NOTIFY_CACHE, "task-reminder");
     console.log("Task reminder complete", { reason, members: sent });
     return { ok: true, reason, members: sent, threadTs };
@@ -1165,6 +1321,231 @@ async function runTaskReminderFlow(
     console.error("runTaskReminderFlow failed", err);
     return { ok: false, error: err.message };
   }
+}
+
+/**
+ * 24:00(翌0時)に、その日の各メンバーの進捗SPと進捗のあったタスクを当日スレッドに投稿する。
+ * 朝(8:30)の起点(day-start)と現在値を比較し、進捗SPが増えたタスクを担当者ごとに列挙（メンションなし・名前のみ）。
+ */
+async function runDailyProgressSummary(env: Env, reason: string): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+  const channel = config.slackPmoChannelId ?? "";
+  if (!channel) return { ok: true, skipped: true, reason: "no channel" };
+
+  const now = new Date();
+  // 24:00(翌0時)に走るので、集計対象の「その日」は前日。manual テスト時は当日。
+  const summaryDate = toJstDateString(now, reason === "manual" ? 0 : -1);
+  const dayStart = await getDayStartProgress(env.NOTIFY_CACHE, summaryDate);
+  if (Object.keys(dayStart).length === 0) {
+    console.log(`Daily progress summary: no day-start data for ${summaryDate}, skip`);
+    return { ok: true, skipped: true, reason: "no day-start" };
+  }
+  const threadTs = (await getCurrentTaskThread(env.NOTIFY_CACHE, channel)) ?? undefined;
+
+  // 現在のタスク（期限が今日-3〜今日+10）
+  const dueStart = toJstDateString(now, -3);
+  const dueEnd = toJstDateString(now, 10);
+  const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd).catch(
+    () => ({ assignees: [] as SprintTasksSummary["assignees"] })
+  );
+
+  const current = new Map<string, { name: string; status: string | null; sp: number | null; assignees: string[]; projectName: string | null }>();
+  for (const a of dueRange.assignees) {
+    if (a.name === "未割当") continue;
+    for (const t of a.tasks) {
+      const ex = current.get(t.id);
+      if (ex) {
+        if (!ex.assignees.includes(a.name)) ex.assignees.push(a.name);
+      } else {
+        current.set(t.id, { name: t.name, status: t.status ?? null, sp: t.sp ?? null, assignees: [a.name], projectName: t.projectName ?? null });
+      }
+    }
+  }
+
+  // 進捗SPが増えたタスクを担当者ごとに集計（テーブル行 + 合計進捗SP）
+  const byAssignee = new Map<string, { rows: ProgressTableRow[]; total: number }>();
+  const allIds = new Set([...Object.keys(dayStart), ...current.keys()]);
+  for (const pageId of allIds) {
+    const start = dayStart[pageId];
+    const cur = current.get(pageId);
+    if (!start || !cur) continue;
+    const sp = cur.sp ?? start.sp ?? 0;
+    const delta =
+      Math.round((sp * statusProgressRate(cur.status) - sp * statusProgressRate(start.status)) * 10) / 10;
+    if (delta <= 0) continue; // 進捗SPが増えたものだけ
+    const row = taskToProgressRow(
+      { name: cur.name, status: cur.status, sp: cur.sp, projectName: cur.projectName },
+      { status: start.status, sp: start.sp }
+    );
+    for (const assignee of cur.assignees) {
+      const entry = byAssignee.get(assignee) ?? { rows: [], total: 0 };
+      entry.rows.push(row);
+      entry.total = Math.round((entry.total + delta) * 10) / 10;
+      byAssignee.set(assignee, entry);
+    }
+  }
+
+  const lines: string[] = [`📊 本日の進捗サマリー（${summaryDate}）`, ""];
+  if (byAssignee.size === 0) {
+    lines.push("本日、進捗SPが増えたタスクはありませんでした。");
+  } else {
+    for (const [assignee, { rows, total }] of byAssignee) {
+      lines.push(`${assignee}  \`進捗SP +${total}\``);
+      lines.push(renderProgressTable(rows));
+      lines.push("");
+    }
+  }
+  await chatPostMessage(config.slackBotToken, channel, lines.join("\n").trimEnd(), undefined, threadTs);
+  console.log(`Daily progress summary posted: ${byAssignee.size} members with progress`);
+  return { ok: true, members: byAssignee.size };
+}
+
+// ── Notion Webhook 受信ハンドラ ─────────────────────────────────────────────
+// Notion でタスクのプロパティが変わると Notion → このエンドポイントに POST が来る。
+// payload には page_id のみ含まれる（変更内容は無い）ので、ページを再取得して
+// KV のスナップショットと比較し、変化があれば当日スレッドに通知する。
+
+/** Notion webhook payload から page_id を抽出（複数のpayload形状に対応）。 */
+function extractNotionPageId(payload: any): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  // 公式 integration webhook: entity.id / data.entity.id
+  const candidates = [
+    payload?.entity?.id,
+    payload?.data?.entity?.id,
+    payload?.data?.id,
+    payload?.page?.id,
+    payload?.page_id,
+    payload?.id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.replace(/-/g, "").length === 32) return c;
+  }
+  return null;
+}
+
+async function handleNotionWebhook(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext
+): Promise<Response> {
+  const body = await request.text();
+  let payload: any;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return new Response("invalid json", { status: 400 });
+  }
+
+  // 初回の検証リクエスト: verification_token をログに出す（Notion の UI で確認に使う）
+  if (payload?.verification_token) {
+    console.log(`Notion webhook verification_token: ${payload.verification_token}`);
+    return jsonResponse({ verification_token: payload.verification_token });
+  }
+
+  const pageId = extractNotionPageId(payload);
+  if (!pageId) {
+    console.log("Notion webhook: no page_id in payload, ignoring", JSON.stringify(payload).slice(0, 200));
+    return new Response("ok");
+  }
+
+  // 変更検出・通知はバックグラウンドで（Notion には即 200 を返す）
+  const task = handleNotionChange(env, pageId).catch((err) =>
+    console.error("handleNotionChange failed:", (err as Error).message)
+  );
+  if (ctx) ctx.waitUntil(task);
+  return new Response("ok");
+}
+
+/**
+ * ステータス名から進捗率(0〜1)を返す。
+ *   doing(20%) → 0.2, doing(60%)M2✅ → 0.6, 完了/Done → 1.0
+ *   Backlog/Ready/ペンディング/中止/他者ボール 等 → 0（進捗SPに寄与しない）
+ */
+function statusProgressRate(status: string | null): number {
+  if (!status) return 0;
+  if (status.includes("完了") || /\bdone\b/i.test(status)) return 1.0;
+  const m = status.match(/(\d+)\s*%/);
+  if (m) return Math.min(100, parseInt(m[1], 10)) / 100;
+  return 0;
+}
+
+/** page_id のスナップショットと現在値を比較し、変化があれば当日スレッドに通知する。 */
+async function handleNotionChange(env: Env, pageId: string): Promise<void> {
+  const snapshot = await getTaskSnapshot(env.NOTIFY_CACHE, pageId);
+  if (!snapshot) {
+    console.log(`Notion webhook: no snapshot for page ${pageId} (当日スレッドに無いタスク) — skip`);
+    return;
+  }
+  const config = getConfig(env);
+  if (!config.slackBotToken) return;
+
+  const current = await fetchTaskPropertiesById(config, pageId);
+  if (!current) {
+    console.warn(`Notion webhook: failed to fetch page ${pageId}`);
+    return;
+  }
+
+  // 差分検出
+  const changes: string[] = [];
+  let statusChanged = false;
+  if (snapshot.status !== current.status) {
+    statusChanged = true;
+    changes.push(`・ステータス：${snapshot.status ?? "なし"} → ${current.status ?? "なし"}`);
+    // 進捗SP: doing/完了 が関わるステータス変更のときだけ表示
+    //   (backlog↔ready↔pending 等の変化では進捗SPは動かないので出さない)
+    const sp = current.sp ?? snapshot.sp ?? 0;
+    const oldRate = statusProgressRate(snapshot.status);
+    const newRate = statusProgressRate(current.status);
+    if (oldRate > 0 || newRate > 0) {
+      const c = Math.round(sp * oldRate * 10) / 10;
+      const d = Math.round(sp * newRate * 10) / 10;
+      const diff = Math.round((d - c) * 10) / 10;
+      const sign = diff > 0 ? "+" : "";
+      changes.push(`・進捗SP：${c} → ${d}（${sign}${diff}）`);
+    }
+  }
+  const prevA = [...snapshot.assignees].sort().join("、");
+  const curA = [...current.assignees].sort().join("、");
+  if (prevA !== curA) {
+    changes.push(`・担当者：${prevA || "なし"} → ${curA || "なし"}`);
+  }
+  if ((snapshot.due ?? null) !== (current.due ?? null)) {
+    changes.push(`・期限：${snapshot.due ?? "なし"} → ${current.due ?? "なし"}`);
+  }
+  if ((snapshot.sp ?? null) !== (current.sp ?? null)) {
+    changes.push(`・SP：${snapshot.sp ?? "なし"} → ${current.sp ?? "なし"}`);
+  }
+
+  if (changes.length === 0) {
+    console.log(`Notion webhook: page ${pageId} updated but no tracked property changed`);
+    // スナップショットは最新化しておく（本文等の変更でも値を揃える）
+    await saveTaskSnapshot(env.NOTIFY_CACHE, pageId, {
+      ...snapshot,
+      taskName: current.name || snapshot.taskName,
+    }).catch(() => {});
+    return;
+  }
+
+  const taskName = current.name || snapshot.taskName;
+  const assigneeLabel = current.assignees.length > 0 ? current.assignees.join("、") : "担当者未設定";
+  const header = statusChanged
+    ? `${assigneeLabel}のタスク「${taskName}」のステータスが更新されました。`
+    : `${assigneeLabel}のタスク「${taskName}」が更新されました。`;
+  const msg = `${header}\n${changes.join("\n")}`;
+  await chatPostMessage(config.slackBotToken, snapshot.channel, msg, undefined, snapshot.threadTs);
+  console.log(`Notion webhook: notified thread ${snapshot.threadTs} — ${changes.join(" / ")}`);
+
+  // スナップショットを現在値で更新（同じ変更で二重通知しないため）
+  await saveTaskSnapshot(env.NOTIFY_CACHE, pageId, {
+    threadTs: snapshot.threadTs,
+    channel: snapshot.channel,
+    taskName: current.name || snapshot.taskName,
+    status: current.status,
+    assignees: current.assignees,
+    due: current.due,
+    sp: current.sp,
+  }).catch(() => {});
 }
 
 /** Reminder flow: 09:00 JST = 00:00 UTC */
@@ -1905,6 +2286,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return handleSlackEvents(request, env, ctx);
   }
 
+  // Notion Webhook (プロパティ変更通知 → 当日スレッドに「○○が変わりました」を投稿)
+  if (path === "/notion/webhook" && request.method === "POST") {
+    return handleNotionWebhook(request, env, ctx);
+  }
+
   // Slack Reaction handler (Step 8 confirmation via emoji reaction)
   if (path === "/slack/reaction" && request.method === "POST") {
     // Reaction events come via Events API; this endpoint is a convenience alias
@@ -1950,6 +2336,12 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   if (path === "/pmo/morning") {
     const target = url.searchParams.get("target");
     const result = await runMorningFlow(env, "manual", target);
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // 本日の進捗サマリー（手動テスト）: 当日の day-start と現在値を比較してスレッドに投稿
+  if (path === "/pmo/progress-summary") {
+    const result = await runDailyProgressSummary(env, "manual");
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
@@ -2304,8 +2696,17 @@ export default {
       ctx.waitUntil(refreshProjectCatalog(env));
       ctx.waitUntil(refreshUserCatalog(env));
     } else if (event.cron === "30 23 * * *") {
-      // 08:30 JST — Task reminder (per-member task status posted in a thread)
+      // 08:30 JST — Task reminder (full: 親メッセージ + タイムライン + ボード + タスク)
       ctx.waitUntil(runTaskReminderFlow(env, "cron"));
+    } else if (event.cron === "0 5 * * *") {
+      // 14:00 JST — タスク状況の追記リマインド（当日スレッドにテキスト追記）
+      ctx.waitUntil(runTaskReminderFlow(env, "midday"));
+    } else if (event.cron === "0 11 * * *") {
+      // 20:00 JST — タスク状況の追記リマインド（当日スレッドにテキスト追記）
+      ctx.waitUntil(runTaskReminderFlow(env, "evening"));
+    } else if (event.cron === "0 15 * * *") {
+      // 24:00 JST(翌0時) — 本日の進捗サマリー（各メンバーの進捗SPと進捗タスクを当日スレッドに）
+      ctx.waitUntil(runDailyProgressSummary(env, "cron"));
     } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runForAllChannels(env, (ch) => runMorningFlow(env, "cron", null, ch)));

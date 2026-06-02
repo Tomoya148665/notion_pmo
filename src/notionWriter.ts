@@ -432,7 +432,9 @@ export async function searchProjectsByName(
     };
 
     const candidates: ProjectCandidate[] = [];
-    const normalizeProject = (s: string) => s.trim().toLowerCase().replace(/[\s\u3000]+/g, "");
+    // NFKC \u3067\u5168\u89d2/\u534a\u89d2\u3092\u7d71\u4e00\u3057\u3001\u62ec\u5f27\u30fb\u8a18\u53f7\u30fb\u7a7a\u767d\u3092\u9664\u53bb\uff08\uff08\uff09\u2194() \u306e\u63fa\u308c\u3092\u5438\u53ce\uff09
+    const normalizeProject = (s: string) =>
+      s.normalize("NFKC").toLowerCase().replace(/[\s()[\]{}\u300c\u300d\u300e\u300f\u3010\u3011\u30fb,\uff0c.\u3002\u3001]/g, "");
     const nQuery = normalizeProject(projectName);
     // Normalize projectDbId for comparison (remove hyphens)
     const nProjectDbId = projectDbId?.replace(/-/g, "");

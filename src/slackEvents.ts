@@ -24,7 +24,7 @@ import {
   getThreadCreatedTasks
 } from "./workflow";
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen, conversationsInfo, usersInfo } from "./slackBot";
-import { ensureProjectCatalog, resolveProjectFromCache, resolveProjectByChannelName, topProjectCandidates, extractProjectFromText, type CachedProject } from "./projectCatalog";
+import { ensureProjectCatalog, resolveProjectFromCache, resolveProjectByChannelName, topProjectCandidates, extractProjectFromText, saveProjectAlias, resolveProjectByAlias, type CachedProject } from "./projectCatalog";
 import { ensureUserCatalog, makeAssigneeResolver, resolveMemberBySlackId, extractAssigneesFromText, type AssigneeResolver, type CachedUser } from "./userCatalog";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
@@ -281,7 +281,8 @@ export async function sendCompletionNotification(
   botToken: string,
   channel: string,
   results: string[],
-  dryRun: boolean
+  dryRun: boolean,
+  threadTs?: string
 ): Promise<void> {
   if (results.length === 0) return;
 
@@ -296,7 +297,8 @@ export async function sendCompletionNotification(
   const prefix = dryRun ? "（DRY_RUN）" : "";
   const text = `${prefix}✅ Notion更新完了（${timestamp}）\n\n更新内容:\n${results.join("\n")}`;
 
-  await chatPostMessage(botToken, channel, text);
+  // threadTs があれば当日の MM/DD_タスクスレッドに投稿（チャンネルへの直接投稿を避ける）
+  await chatPostMessage(botToken, channel, text, undefined, threadTs);
 }
 
 // ── Execute a list of Notion update actions ────────────────────────────────
@@ -558,6 +560,12 @@ async function handleProjectSelectionReply(
 
   await deletePendingProjectSelection(env.NOTIFY_CACHE, channel, threadTs);
 
+  // 略称→プロジェクトの対応を記録（次回から同じ略称で番号選択不要になる）
+  if (pending.query) {
+    await saveProjectAlias(env.NOTIFY_CACHE, pending.query, { id: selected.id, name: selected.name, team: "" }).catch(() => {});
+    console.log(`Project alias saved: "${pending.query}" → ${selected.name}`);
+  }
+
   // Build confirmation message
   const task = pending.newTask;
   const responseText = [
@@ -623,15 +631,20 @@ interface ProjectResolution {
  *  - project === null    → チャンネル名からカタログ照合（ミスなら候補提示）
  * スプリント多数決などのデフォルト補完は行わない。
  */
-function resolveTaskProject(
+async function resolveTaskProject(
+  kv: KVNamespace,
   projectVal: string | null | undefined,
   channelName: string,
   catalog: CachedProject[]
-): ProjectResolution {
+): Promise<ProjectResolution> {
   if (projectVal === "") {
     return { resolvedProjectIds: [], projectDisplay: null };
   }
   if (projectVal) {
+    // ① 記録済みエイリアス（過去に番号選択で確定した略称）を最優先
+    const aliasHit = await resolveProjectByAlias(kv, projectVal, catalog);
+    if (aliasHit) return { resolvedProjectIds: [aliasHit.id], projectDisplay: aliasHit.name };
+    // ② 通常マッチ（exact → 部分一致 → 文字重なりの大雑把マッチ）
     const hit = resolveProjectFromCache(catalog, projectVal);
     if (hit) return { resolvedProjectIds: [hit.id], projectDisplay: hit.name };
     return {
@@ -1167,7 +1180,7 @@ async function handleMention(
           resolvedProjectIds = [ruleProjectMatches[0].id];
           projectDisplay = ruleProjectMatches[0].name;
         } else {
-          const projRes = resolveTaskProject(newTask.project, channelInfoResult.name ?? "", cachedProjectsResult);
+          const projRes = await resolveTaskProject(env.NOTIFY_CACHE, newTask.project, channelInfoResult.name ?? "", cachedProjectsResult);
           resolvedProjectIds = projRes.resolvedProjectIds;
           projectDisplay = projRes.projectDisplay;
           if (projRes.selection) {
@@ -1332,7 +1345,8 @@ async function handleMention(
           candidates,
           requestedBy: userId,
           requestedAt: new Date().toISOString(),
-          fallbackProjectIds: []
+          fallbackProjectIds: [],
+          query: projectSelection.query
         });
         await appendMentionHistory(env.NOTIFY_CACHE, channel, threadTs, userText, askText);
         console.log(`Project selection asked: query="${projectSelection.query}", ${candidates.length} candidates`);

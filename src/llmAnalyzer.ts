@@ -567,6 +567,7 @@ export async function interpretMention(
 - スレッド内で1つだけタスクを作成した直後の更新依頼（担当者変更・SP変更等）は、対象が明示されなくても thread_created_tasks のそのタスクを対象とする（「どのタスクか不明」と聞き返さない）
 - 担当者変更で複数人を指定された場合（例「松田と北川に」）、new_valueにカンマ区切りで全員の名前を入れる（例: "松田, 北川"）
 - update_status（ステータス変更）の new_value は **available_statuses**（実際の選択肢）の値を使う。ユーザーの曖昧指定を最も近い値にマッピング（例:「20%」→"doing(20%)"、「完了」→"完了"、「保留/ペンディング」→"ペンディング"、「中止」→"中止"）。available_statuses 外の値は使わない
+- update_due（期限変更）の new_value は、具体的な時刻も指定されたら ISO datetime "YYYY-MM-DDTHH:mm:00+09:00"（JST）、時刻指定が無ければ "YYYY-MM-DD"。例:「6/3の15時まで」→ "2026-06-03T15:00:00+09:00"、「6/3まで」→ "2026-06-03"
 - 複数のプロパティを同時に変更する依頼（例「担当者を松田にして、ステータスを20%に」）は、それぞれを別の action として actions 配列に複数入れる（update_assignee と update_status を両方返す）
 - ユーザーの指示が曖昧で複数タスクに該当しうる場合は、候補を列挙してどのタスクか確認する（intent="query"、actionsは空）
 - new_tasksは空配列 []
@@ -589,12 +590,13 @@ export async function interpretMention(
 - intent = "update"（updateとして扱う）
 
 **create_task（タスク追加）**: 新しいタスクをNotionに追加するリクエスト
-- 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限 YYYY-MM-DD）、sp（SP）
+- 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限。時刻指定があれば ISO datetime "YYYY-MM-DDTHH:mm:00+09:00"、なければ YYYY-MM-DD）、sp（SP）
 - ⚠️ due（期限）の決定ルール（厳守・最優先）:
   1. 会話（user_message・thread_context・channel_context・conversation_history）のどこかに期限が書かれていたら、必ずそれを最優先で使う。
      「これ起票して」「それタスク化」等の「これ/それ」が指す直前のメッセージ群に期限が書かれていることが非常に多い。起票指示の前後のメッセージを必ず確認すること。
      - 相対表現は user_prompt の today（YYYY-MM-DD）を基準に変換する: 「今日」→today / 「明日」→todayの翌日 / 「明後日」→today+2日 / 「今週中」「今週末」「今週金曜」→今週の金曜 / 「来週○曜」→翌週の該当曜日 / 「○/○」「○月○日」→その日付（年は当年、過ぎていれば翌年）
-     - 時刻表現（「14時まで」「午前中」「夕方まで」等）は日付に影響させない。日付(YYYY-MM-DD)だけを返す。例: today が 2026-05-31 のとき「明日の14時まで」→ "2026-06-01"
+     - 具体的な時刻（「14時まで」「15:30」「17時」等）も指定されたら ISO 8601 datetime（JST=+09:00）で返す。例: today が 2026-05-31 のとき「明日の14時まで」→ "2026-06-01T14:00:00+09:00"
+     - 「午前中」「夕方」「夜」等の曖昧な時間帯、または時刻の指定が無い場合は日付のみ(YYYY-MM-DD)を返す
   2. 会話のどこにも期限の言及が無い場合のみ → **SP の値に応じて** default_due_by_sp から選ぶ:
      - SP ≤ 3 → default_due_by_sp.lte3 / SP 4-5 → default_due_by_sp.lte5 / SP 6-8 → default_due_by_sp.lte8 / SP > 8 → default_due_by_sp.gt8
   3. ⛔ 会話に期限が書かれているのに SP デフォルトを使ってはならない（1 が 2 に優先する）
