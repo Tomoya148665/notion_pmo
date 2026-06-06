@@ -619,7 +619,7 @@ export async function interpretMention(
   - intent = "create_task"
   - response_textに確認メッセージを生成（全タスクの詳細を一覧表示 + 「✅ 承認ボタンを押してください」）
   - response_textに📝概要は含めない（システム側で別途表示する）
-  - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusはユーザーが指定しない限り "Backlog"
+  - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusはユーザーが指定しない限り "Ready"
   - descriptionは、thread_context / channel_context など会話に十分な情報があれば、その内容（タスクの目的・背景・やるべきこと・手順）を整理して200字以内の概要をセットする。会話に手掛かりが無い場合のみ null（システムが後から自動生成）。「起票して」「担当を変更」「SPを○に」等のBot操作指示や、担当者名・期限・SP等のメタ情報は概要に含めない
 - 必須項目が不足している場合:
   - intent = "create_task"

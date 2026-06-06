@@ -35,7 +35,7 @@ import {
   interpretRepliesAndPropose,
   matchTasksToSchedule
 } from "./llmAnalyzer";
-import { chatPostMessage, conversationsOpen, uploadImageToSlack } from "./slackBot";
+import { chatPostMessage, conversationsOpen, uploadImageToSlack, bulletListBlocks } from "./slackBot";
 import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
 import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName, resolveMemberByName } from "./userCatalog";
 import { buildTimelinePng, renderTimelineHtml } from "./timeline";
@@ -112,10 +112,12 @@ function getDisplayWidth(str: string): number {
 }
 
 function padEndCjk(str: string, targetWidth: number): string {
-  // \u534a\u89d2\u30b9\u30da\u30fc\u30b9\u306e\u307f\u3067\u57cb\u3081\u308b\u3002Slack \u306e\u7b49\u5e45\u30d5\u30a9\u30f3\u30c8\u3067\u306f\u5168\u89d2=2\u5e45 / \u534a\u89d2=1\u5e45\u3067\u5b89\u5b9a\u3059\u308b\u305f\u3081\u3001
-  // 1\u5e45\u5358\u4f4d\u3067\u8abf\u6574\u3067\u304d\u308b\u534a\u89d2\u30b9\u30da\u30fc\u30b9\u304c\u6700\u3082\u30ba\u30ec\u306a\u3044\uff08\u5168\u89d2\u30b9\u30da\u30fc\u30b9\u6df7\u5728\u306f\u7aef\u6570\u3067\u30ac\u30bf\u3064\u304f\uff09\u3002
   const diff = Math.max(0, targetWidth - getDisplayWidth(str));
-  return str + " ".repeat(diff);
+  // \u5168\u89d2\u30b9\u30da\u30fc\u30b9(U+3000)\u4e3b\u4f53\u3067\u57cb\u3081\u308b\u3002Slack \u306e\u7b49\u5e45\u30d5\u30a9\u30f3\u30c8\u3067\u306f CJK \u3082\u5168\u89d2\u30b9\u30da\u30fc\u30b9\u3082 2\u5e45\u3067
+  // \u30ec\u30f3\u30c0\u30ea\u30f3\u30b0\u3055\u308c\u308b\u305f\u3081\u3001\u534a\u89d2\u30b9\u30da\u30fc\u30b9\u3060\u3051\u3067\u57cb\u3081\u308b\u3088\u308a\u6841\u30ba\u30ec(\u7d2f\u7a4d\u30b5\u30d6\u30d4\u30af\u30bb\u30eb\u30c9\u30ea\u30d5\u30c8)\u304c\u51fa\u306b\u304f\u3044\u3002
+  const fwSpaces = Math.floor(diff / 2);
+  const hwRemainder = diff % 2;
+  return str + "\u3000".repeat(fwSpaces) + " ".repeat(hwRemainder);
 }
 
 function formatShortDate(dateStr: string): string {
@@ -170,6 +172,8 @@ function deadlineAlert(
 ): string {
   if (!due) return "";
   if (status && isCompletedStatus(status)) return "";
+  // ペンディング/中止/Backlog のタスクは期限アラート対象外（着手前 or 進行していないため）
+  if (status && /ペンディング|中止|backlog|バックログ/i.test(status)) return "";
   const dueDate = new Date(due.slice(0, 10) + "T00:00:00Z");
   const todayDate = new Date(today + "T00:00:00Z");
   const days = Math.ceil((dueDate.getTime() - todayDate.getTime()) / 86400000);
@@ -1124,8 +1128,8 @@ async function runTaskReminderFlow(
     const now = new Date();
     const today = toJstDateString(now);
     const dateLabel = today.slice(5).replace("-", "/"); // "MM/DD"
-    const dueStart = toJstDateString(now, -3); // 今日-3日
-    const dueEnd = toJstDateString(now, 10);   // 今日+10日
+    const dueStart = toJstDateString(now, -30); // 今日-30日（期限切れは30日前まで一覧表示）
+    const dueEnd = toJstDateString(now, 10);    // 今日+10日
 
     // スケジュール分析はスプリントベース（現状のスプリント検出）
     const summary = await fetchCurrentSprintTasksSummary(config, now);
@@ -1140,7 +1144,7 @@ async function runTaskReminderFlow(
     let avgDailySp: number | null = spConsumption ? spConsumption.avgDailySp : null;
     if (avgDailySp == null) avgDailySp = calcAvgDailySpFromSprint(summary, today);
 
-    // 各自のタスクはスプリント非依存: 期限が今日-3日〜今日+10日の未完了タスクを直接取得
+    // 各自のタスクはスプリント非依存: 期限が今日-30日〜今日+10日の未完了タスクを直接取得
     const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd);
     const isUpdate = reason === "midday" || reason === "evening";
     const memberTables = buildPerMemberTaskTables(dueRange.assignees, today, reason);
@@ -1268,11 +1272,32 @@ async function runTaskReminderFlow(
       sent++;
     }
 
+    // 3.5 担当者未定のタスク一覧（他の一覧と同形式・メンションなし）
+    const unassignedGrp = dueRange.assignees.find((a) => a.name === "未割当");
+    if (unassignedGrp) {
+      const rows = unassignedGrp.tasks
+        .filter((t) => !isCompletedStatus(t.status))
+        .map((t) => taskToTableRow(t, today, reason));
+      if (rows.length > 0) {
+        await chatPostMessage(
+          config.slackBotToken,
+          channel,
+          `【担当者未定のタスク】\n${renderTaskTable(rows)}`,
+          undefined,
+          threadTs
+        );
+      }
+    }
+
     // Notion webhook の変更検出用スナップショット保存
     //   page_id ごとに「このスレッド(threadTs)」と現在のプロパティ値を記録。
     //   以降、Notion でプロパティが変わると webhook がこのスレッドに通知する。
+    //   表示テーブルは今日-3〜+10 に限定するが、webhook 対象は広めに取る:
+    //   下限なし(=何日前の期限切れでも) + 期限なし + 今日+10 まで。完了タスクは extractTaskRow が除外。
+    const snapshotSource = await fetchTasksByDueRange(config, null, dueEnd, "期限", { includeNoDue: true })
+      .catch(() => dueRange);
     const snapshotMap = new Map<string, { name: string; status: string | null; due: string | null; sp: number | null; assignees: string[] }>();
-    for (const a of dueRange.assignees) {
+    for (const a of snapshotSource.assignees) {
       if (a.name === "未割当") continue;
       for (const t of a.tasks) {
         const ex = snapshotMap.get(t.id);
@@ -1343,14 +1368,26 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
   }
   const threadTs = (await getCurrentTaskThread(env.NOTIFY_CACHE, channel)) ?? undefined;
 
+  // 朝(8:30)と同じ【スケジュール分析】を 24:00 にも当日スレッドに送る。
+  const sprintSummary = await fetchCurrentSprintTasksSummary(config, now).catch(() => null);
+  if (sprintSummary) {
+    const spc = await calculateAvgDailySpConsumption(env.NOTIFY_CACHE, sprintSummary.sprint.id, summaryDate).catch(() => null);
+    let avgDailySp: number | null = spc ? spc.avgDailySp : null;
+    if (avgDailySp == null) avgDailySp = calcAvgDailySpFromSprint(sprintSummary, summaryDate);
+    const analysis = buildScheduleAnalysis(sprintSummary, avgDailySp, summaryDate);
+    await chatPostMessage(config.slackBotToken, channel, analysis, undefined, threadTs).catch(() => {});
+    console.log(`Daily progress summary: posted schedule analysis for ${summaryDate}`);
+  }
+
   // 現在のタスク（期限が今日-3〜今日+10）
   const dueStart = toJstDateString(now, -3);
   const dueEnd = toJstDateString(now, 10);
-  const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd).catch(
+  // 完了タスクも含めて取得する（起票→即完了 や doing→完了 の進捗SPを計上するため）。
+  const dueRange = await fetchTasksByDueRange(config, dueStart, dueEnd, "期限", { includeCompleted: true }).catch(
     () => ({ assignees: [] as SprintTasksSummary["assignees"] })
   );
 
-  const current = new Map<string, { name: string; status: string | null; sp: number | null; assignees: string[]; projectName: string | null }>();
+  const current = new Map<string, { name: string; status: string | null; sp: number | null; assignees: string[]; projectName: string | null; createdTime: string | null }>();
   for (const a of dueRange.assignees) {
     if (a.name === "未割当") continue;
     for (const t of a.tasks) {
@@ -1358,7 +1395,7 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
       if (ex) {
         if (!ex.assignees.includes(a.name)) ex.assignees.push(a.name);
       } else {
-        current.set(t.id, { name: t.name, status: t.status ?? null, sp: t.sp ?? null, assignees: [a.name], projectName: t.projectName ?? null });
+        current.set(t.id, { name: t.name, status: t.status ?? null, sp: t.sp ?? null, assignees: [a.name], projectName: t.projectName ?? null, createdTime: t.createdTime ?? null });
       }
     }
   }
@@ -1367,16 +1404,31 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
   const byAssignee = new Map<string, { rows: ProgressTableRow[]; total: number }>();
   const allIds = new Set([...Object.keys(dayStart), ...current.keys()]);
   for (const pageId of allIds) {
-    const start = dayStart[pageId];
     const cur = current.get(pageId);
-    if (!start || !cur) continue;
-    const sp = cur.sp ?? start.sp ?? 0;
+    if (!cur) continue; // 現在のタスク状態が取れないものは対象外
+    const start = dayStart[pageId];
+    // ベースライン(その日の起点)を決める:
+    //   ① 朝の起点があればそれを使う
+    //   ② 起点が無くても「当日作成」なら進捗0から開始とみなす（起票→即完了も計上する）
+    //   ③ それ以外（起点無し & 当日作成でもない = 過去に完了済み等）は当日の進捗ではないので除外
+    let baseStatus: string | null;
+    let baseSp: number | null;
+    if (start) {
+      baseStatus = start.status;
+      baseSp = start.sp;
+    } else if (cur.createdTime === summaryDate) {
+      baseStatus = null; // rate 0
+      baseSp = cur.sp;
+    } else {
+      continue;
+    }
+    const sp = cur.sp ?? baseSp ?? 0;
     const delta =
-      Math.round((sp * statusProgressRate(cur.status) - sp * statusProgressRate(start.status)) * 10) / 10;
+      Math.round((sp * statusProgressRate(cur.status) - sp * statusProgressRate(baseStatus)) * 10) / 10;
     if (delta <= 0) continue; // 進捗SPが増えたものだけ
     const row = taskToProgressRow(
       { name: cur.name, status: cur.status, sp: cur.sp, projectName: cur.projectName },
-      { status: start.status, sp: start.sp }
+      { status: baseStatus, sp: baseSp }
     );
     for (const assignee of cur.assignees) {
       const entry = byAssignee.get(assignee) ?? { rows: [], total: 0 };
@@ -1398,6 +1450,30 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
   }
   await chatPostMessage(config.slackBotToken, channel, lines.join("\n").trimEnd(), undefined, threadTs);
   console.log(`Daily progress summary posted: ${byAssignee.size} members with progress`);
+
+  // 担当者未定のタスク一覧（8:30と同形式・期限-30〜+10日・メンションなし）
+  const todayActual = toJstDateString(now);
+  const listStart = toJstDateString(now, -30);
+  const listEnd = toJstDateString(now, 10);
+  const listRange = await fetchTasksByDueRange(config, listStart, listEnd).catch(
+    () => ({ assignees: [] as SprintTasksSummary["assignees"] })
+  );
+  const unassignedGrp = listRange.assignees.find((a) => a.name === "未割当");
+  if (unassignedGrp) {
+    const rows = unassignedGrp.tasks
+      .filter((t) => !isCompletedStatus(t.status))
+      .map((t) => taskToTableRow(t, todayActual, reason));
+    if (rows.length > 0) {
+      await chatPostMessage(
+        config.slackBotToken,
+        channel,
+        `【担当者未定のタスク】\n${renderTaskTable(rows)}`,
+        undefined,
+        threadTs
+      );
+    }
+  }
+
   return { ok: true, members: byAssignee.size };
 }
 
@@ -1489,23 +1565,26 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   // 差分検出
   const changes: string[] = [];
   let statusChanged = false;
-  let progressArrow = ""; // 進捗SPの増減で矢印を変える（増→↗️ / 減→↘️）
+  let progressArrow = ""; // 進捗SPが増えたとき↗️
+  // これまでに計上済みの最高進捗率(基準)。Pending/他者ボール等(0%)を挟んでも二重計上しない。
+  // 旧スナップショット(peakRate無し)は snapshot.status の率でフォールバック。
+  const baseRate = Math.max(snapshot.peakRate ?? 0, statusProgressRate(snapshot.status));
+  const newPeakRate = Math.max(baseRate, statusProgressRate(current.status));
   if (snapshot.status !== current.status) {
     statusChanged = true;
     // ステータスは N% 表示（doing(60%) → 60%）
     changes.push(`ステータス：${simplifyStatus(snapshot.status)} → ${simplifyStatus(current.status)}`);
-    // 進捗SP: doing/完了 が関わるステータス変更のときだけ表示
-    //   (backlog↔ready↔pending 等の変化では進捗SPは動かないので出さない)
+    // 進捗SP: 「基準率(計上済みの最高率)より増えたとき」だけ表示する。
+    //   例) 60%→他者ボール→完了 の差分は +40%（+100%ではない）。
+    //   doing→Pending/Backlog/中止/他者ボール 等は一時停止なので進捗ダウンは出さない。
     const sp = current.sp ?? snapshot.sp ?? 0;
-    const oldRate = statusProgressRate(snapshot.status);
     const newRate = statusProgressRate(current.status);
-    if (oldRate > 0 || newRate > 0) {
-      const c = Math.round(sp * oldRate * 10) / 10;
+    const diff = Math.round((newRate - baseRate) * sp * 10) / 10;
+    if (diff > 0) {
+      const c = Math.round(sp * baseRate * 10) / 10;
       const d = Math.round(sp * newRate * 10) / 10;
-      const diff = Math.round((d - c) * 10) / 10;
-      const sign = diff > 0 ? "+" : "";
-      changes.push(`進捗SP：${c} → ${d}（${sign}${diff}）`);
-      progressArrow = diff > 0 ? ":arrow_upper_right:" : diff < 0 ? ":arrow_lower_right:" : "";
+      changes.push(`進捗SP：${c} → ${d}（+${diff}）`);
+      progressArrow = ":arrow_upper_right:";
     }
   }
   const prevA = [...snapshot.assignees].sort().join("、");
@@ -1526,6 +1605,7 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
     await saveTaskSnapshot(env.NOTIFY_CACHE, pageId, {
       ...snapshot,
       taskName: current.name || snapshot.taskName,
+      peakRate: newPeakRate,
     }).catch(() => {});
     return;
   }
@@ -1537,8 +1617,10 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   const title = statusChanged
     ? `${icon}  ${assigneeLabel}のタスク「${taskName}」のステータスが更新されました。`
     : `${icon}  ${assigneeLabel}のタスク「${taskName}」が更新されました。`;
-  const msg = `${title}\n\n${changes.join("\n")}`;
-  await chatPostMessage(config.slackBotToken, snapshot.channel, msg, undefined, snapshot.threadTs);
+  // 変更点は rich_text_list でネイティブ箇条書き描画（text はフォールバック/通知プレビュー用）
+  const msg = `${title}\n${changes.map((c) => `• ${c}`).join("\n")}`;
+  const blocks = bulletListBlocks(title, changes);
+  await chatPostMessage(config.slackBotToken, snapshot.channel, msg, blocks, snapshot.threadTs);
   console.log(`Notion webhook: notified thread ${snapshot.threadTs} — ${changes.join(" / ")}`);
 
   // スナップショットを現在値で更新（同じ変更で二重通知しないため）
@@ -1550,6 +1632,7 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
     assignees: current.assignees,
     due: current.due,
     sp: current.sp,
+    peakRate: newPeakRate,
   }).catch(() => {});
 }
 

@@ -140,6 +140,34 @@ export async function conversationsOpen(
   return data.channel?.id ?? "";
 }
 
+/**
+ * 「タイトル行 + ネイティブ箇条書き」の Slack blocks を組み立てる。
+ * Slack の section(mrkdwn) は "- "/"• " をネイティブの箇条書きに変換しないため、
+ * rich_text_list(style:bullet) を使う（インデント付きの正式な箇条書きで描画される）。
+ * タイトルは絵文字ショートコード(:arrow_upper_right: 等)を描画させるため mrkdwn section に置く。
+ */
+export function bulletListBlocks(title: string, bullets: string[]): unknown[] {
+  const blocks: unknown[] = [
+    { type: "section", text: { type: "mrkdwn", text: title } }
+  ];
+  if (bullets.length > 0) {
+    blocks.push({
+      type: "rich_text",
+      elements: [
+        {
+          type: "rich_text_list",
+          style: "bullet",
+          elements: bullets.map((b) => ({
+            type: "rich_text_section",
+            elements: [{ type: "text", text: b }]
+          }))
+        }
+      ]
+    });
+  }
+  return blocks;
+}
+
 export async function chatPostMessage(
   token: string,
   channel: string,

@@ -210,3 +210,8 @@ __marimo__/
 node_modules
 .dev.vars
 .wrangler/
+# Ralph Loop の状態ファイル(セッション固有・コミット不要)
+.claude/ralph-loop.local.json
+
+# Ralph Loop 定期実行のログ(コミット不要)
+logs/

@@ -1,7 +1,7 @@
 import type { Bindings } from "./config";
 import { getConfig } from "./config";
 import { resolveConfig } from "./channelConfig";
-import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies } from "./slackBot";
+import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies, bulletListBlocks } from "./slackBot";
 import {
   getPendingAction,
   deletePendingAction,
@@ -17,7 +17,8 @@ import {
   deletePhoneReminder,
   appendThreadCreatedTasks,
   getCurrentTaskThread,
-  saveTaskSnapshot
+  saveTaskSnapshot,
+  claimTaskCreation
 } from "./workflow";
 import {
   executeNotionActions,
@@ -398,6 +399,13 @@ async function handleTaskActionButton(
           description?: string;
           relevantUrls?: string[];
         };
+        // 冪等化: 同一スレッド+タスク名の二重作成を防ぐ（訂正リプライ連投で確認が並存するケース）
+        const dedupThreadKey = threadTs ?? pending.threadTs ?? messageTs;
+        const claimed = await claimTaskCreation(env.NOTIFY_CACHE, channel, dedupThreadKey, newTask.task_name);
+        if (!claimed) {
+          console.warn(`Skip duplicate task creation: "${newTask.task_name}" in thread ${dedupThreadKey}`);
+          return { result: { message: `⚠️ 「${newTask.task_name}」は直近に作成済みのため重複作成をスキップしました`, pageId: undefined as string | undefined }, newTask };
+        }
         const result = await executeTaskCreation(
           {
             notionToken: config.notionToken,
@@ -469,14 +477,17 @@ async function handleTaskActionButton(
       const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
       const assignees = [...new Set(taskResults.map((r) => r.newTask.assignee))];
       const assigneeLabel = assignees.length === 1 ? `${assignees[0]}の` : "";
-      const lines = [`✅ ${assigneeLabel}タスクが追加されました`, ""];
+      const title = `✅ ${assigneeLabel}タスクが追加されました`;
+      const bullets: string[] = [];
       for (const r of taskResults) {
         const t = r.newTask;
         const dueDisp = t.due ? t.due.slice(5, 10) : "-"; // YYYY-MM-DD → MM-DD
         const proj = t.project ? t.project : "-";
-        lines.push(`- タスク：「${t.task_name}」（担当：${t.assignee}、Prj：${proj}、期限：${dueDisp}、SP：${t.sp}）`);
+        bullets.push(`タスク：「${t.task_name}」（担当：${t.assignee}、Prj：${proj}、期限：${dueDisp}、SP：${t.sp}）`);
       }
-      await chatPostMessage(config.slackBotToken, pmoChannel, lines.join("\n"), undefined, taskThread ?? undefined);
+      // rich_text_list でネイティブ箇条書き描画（text はフォールバック）
+      const fallback = `${title}\n${bullets.map((b) => `• ${b}`).join("\n")}`;
+      await chatPostMessage(config.slackBotToken, pmoChannel, fallback, bulletListBlocks(title, bullets), taskThread ?? undefined);
 
       // 起票したタスクの snapshot を Notion 正式値で保存 → 以降の更新を webhook が当日スレッドに通知できる
       if (taskThread) {

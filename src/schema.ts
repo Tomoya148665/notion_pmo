@@ -82,7 +82,8 @@ export const sprintTasksSchema = z.object({
           subItem: z.string().optional().nullable(),
           company: z.string().optional().nullable(),
           url: z.string().url().optional().nullable(),
-          projectName: z.string().optional().nullable()
+          projectName: z.string().optional().nullable(),
+          createdTime: z.string().optional().nullable()
         })
       )
     })

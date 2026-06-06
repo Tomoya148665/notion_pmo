@@ -93,6 +93,23 @@ function detectIntentHint(text: string): "create" | "other" {
 
 // ── Execute a Notion task creation ──────────────────────────────────────────
 
+/**
+ * 期限を表示用に整形する。
+ *   日付のみ          "2026-06-05"                 → "2026-06-05"
+ *   日時(時刻あり)    "2026-06-08T18:00:00+09:00"  → "2026-06-08 18:00"（JST）
+ *   時刻が 00:00 のときは日付のみ表示。
+ */
+export function formatDueForDisplay(due: string | null | undefined): string {
+  if (!due) return "-";
+  if (!due.includes("T")) return due.slice(0, 10);
+  const d = new Date(due);
+  if (isNaN(d.getTime())) return due;
+  const jst = new Date(d.getTime() + 9 * 3600 * 1000);
+  const date = jst.toISOString().slice(0, 10);
+  const time = jst.toISOString().slice(11, 16);
+  return time === "00:00" ? date : `${date} ${time}`;
+}
+
 export async function executeTaskCreation(
   config: {
     notionToken: string;
@@ -157,20 +174,31 @@ export async function executeTaskCreation(
     return undefined;
   };
 
-  let assigneeId: string | undefined;
-  // Primary: pre-built member alias resolver (handles kanji/hiragana/romaji variations)
-  if (resolveAssignee) {
-    assigneeId = resolveAssignee(task.assignee);
-    console.log(`Assignee via resolver: "${task.assignee}" → ${assigneeId ?? "(not found)"}`);
-  }
-  // Fallback: legacy findUser against Notion task DB + workspace users (for non-member names)
-  if (!assigneeId) {
-    const dbMap = userMaps?.dbUserMap ?? (config.taskDbId ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId) : new Map<string, string>());
-    assigneeId = findUser(dbMap, task.assignee);
-    if (!assigneeId) {
-      const notionMap = userMaps?.notionUserMap ?? await fetchNotionUserMap(config.notionToken);
-      assigneeId = findUser(notionMap, task.assignee);
+  // 複数担当者対応: "松田, 古鉄" 等をカンマ/読点/スラッシュで分割し、各名を個別に解決する。
+  const assigneeNames = task.assignee
+    .split(/[,、，･・\/／]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const assigneeIds: string[] = [];
+  const unresolvedNames: string[] = [];
+  let dbMap: Map<string, string> | undefined;
+  let notionMap: Map<string, string> | undefined;
+  for (const name of assigneeNames) {
+    let id: string | undefined;
+    // Primary: pre-built member alias resolver (handles kanji/hiragana/romaji variations)
+    if (resolveAssignee) id = resolveAssignee(name);
+    // Fallback: legacy findUser against Notion task DB + workspace users (for non-member names)
+    if (!id) {
+      if (!dbMap) dbMap = userMaps?.dbUserMap ?? (config.taskDbId ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId) : new Map<string, string>());
+      id = findUser(dbMap, name);
     }
+    if (!id) {
+      if (!notionMap) notionMap = userMaps?.notionUserMap ?? await fetchNotionUserMap(config.notionToken);
+      id = findUser(notionMap, name);
+    }
+    console.log(`Assignee resolve: "${name}" → ${id ?? "(not found)"}`);
+    if (id && !assigneeIds.includes(id)) assigneeIds.push(id);
+    else if (!id) unresolvedNames.push(name);
   }
 
   // ── Due date safety net: if LLM returned a past date, override with SP-based default ──
@@ -196,8 +224,8 @@ export async function executeTaskCreation(
     カテゴリ: { select: { name: "タスク" } }
   };
 
-  if (assigneeId) {
-    properties["担当者"] = { people: [{ id: assigneeId }] };
+  if (assigneeIds.length > 0) {
+    properties["担当者"] = { people: assigneeIds.map((id) => ({ id })) };
   }
 
   if (task.sprintId) {
@@ -214,15 +242,20 @@ export async function executeTaskCreation(
     };
   }
 
-  console.log(`createTask: sprintId=${task.sprintId ?? "(none)"}, projectIds=${task.projectIds?.join(",") ?? "(none)"}, assigneeId=${assigneeId ?? "(none)"}`);
+  console.log(`createTask: sprintId=${task.sprintId ?? "(none)"}, projectIds=${task.projectIds?.join(",") ?? "(none)"}, assigneeIds=[${assigneeIds.join(",") || "(none)"}], unresolved=[${unresolvedNames.join(",")}]`);
   console.log(`createTask properties:`, JSON.stringify(properties));
 
+  // 一部だけ未検出のときも警告を残す
+  const unresolvedNote =
+    unresolvedNames.length > 0
+      ? assigneeIds.length > 0
+        ? `（⚠️ 未検出: ${unresolvedNames.join(", ")}）`
+        : `（⚠️ Notion ユーザー未検出のため担当者未設定）`
+      : "";
+
   if (config.dryRun) {
-    const assigneeNote = assigneeId
-      ? `${task.assignee} (${assigneeId})`
-      : `${task.assignee} (⚠️ Notion ユーザー未検出)`;
-    console.log(`DRY_RUN: create task "${task.task_name}" assignee=${assigneeNote}`);
-    return { message: `（DRY_RUN）タスク「${task.task_name}」を作成予定\n担当: ${assigneeNote}\n期限: ${task.due}\nSP: ${task.sp}` };
+    console.log(`DRY_RUN: create task "${task.task_name}" assignees=${task.assignee} ids=[${assigneeIds.join(",")}]`);
+    return { message: `（DRY_RUN）タスク「${task.task_name}」を作成予定\n担当: ${task.assignee}${unresolvedNote}\n期限: ${task.due}\nSP: ${task.sp}` };
   }
 
   let createdPage: { id: string; url: string } | undefined;
@@ -233,16 +266,14 @@ export async function executeTaskCreation(
     return { message: `❌ タスク作成失敗: ${task.task_name}\nエラー: ${(err as Error).message}` };
   }
 
-  const assigneeNote = assigneeId
-    ? task.assignee
-    : `${task.assignee}（⚠️ Notion ユーザー未検出のため担当者未設定）`;
+  const assigneeNote = `${task.assignee}${unresolvedNote}`;
 
   const taskLink = createdPage?.url
     ? `<${createdPage.url}|${task.task_name}>`
     : task.task_name;
 
   return {
-    message: `✅ タスク作成完了\n・タスク名: ${taskLink}\n・担当: ${assigneeNote}\n・期限: ${finalDue}\n・SP: ${task.sp}`,
+    message: `✅ タスク作成完了\n・タスク名: ${taskLink}\n・担当: ${assigneeNote}\n・期限: ${formatDueForDisplay(finalDue)}\n・SP: ${task.sp}`,
     pageId: createdPage?.id
   };
 }
@@ -1227,6 +1258,7 @@ async function handleMention(
 
         // Resolve sprint from LLM output (null = backlog)
         let resolvedSprintId: string | undefined;
+        let resolvedSprintName: string | null = newTask.sprint ?? null;
         let sprintDisplay: string | null = null;
         if (newTask.sprint) {
           const sprintVal = newTask.sprint.trim();
@@ -1258,29 +1290,49 @@ async function handleMention(
             });
           if (matchedSprint) {
             resolvedSprintId = matchedSprint.id;
+            resolvedSprintName = matchedSprint.name;
             sprintDisplay = matchedSprint.name;
           } else {
             // Fallback: use current sprint if available
             const currentSprint = allSprints.find((s) => s.id === summary.sprint.id);
             if (currentSprint) {
               resolvedSprintId = currentSprint.id;
+              resolvedSprintName = currentSprint.name;
               sprintDisplay = `${currentSprint.name}（「${sprintVal}」→ 現スプリントに設定）`;
               console.log(`Sprint fuzzy fallback: "${sprintVal}" → current sprint "${currentSprint.name}"`);
             } else {
               sprintDisplay = `${sprintVal}（⚠️ 未検出）`;
             }
           }
+        } else {
+          // スプリント未指定: 今日(JST)を含むスプリントがあれば既定提案する（無ければバックログのまま）。
+          // summary.sprint は「今日を含む or active or 先頭」なので、実際に今日を含むかを日付で確認する。
+          const cur = summary.sprint;
+          if (cur && cur.start_date && cur.end_date && cur.start_date <= today && today <= cur.end_date) {
+            resolvedSprintId = cur.id;
+            resolvedSprintName = cur.name;
+            sprintDisplay = cur.name;
+            console.log(`Sprint auto-suggest: today ${today} ∈ "${cur.name}" (${cur.start_date}〜${cur.end_date}) → default`);
+          }
         }
-        // sprint が null → バックログ（sprintId なし）
+        // 上記いずれにも該当しない → バックログ（sprintId なし）
 
+        // 起票時の既定ステータスは Ready（ユーザー/LLM が明示しない限り）
+        const taskStatus = newTask.status ?? "Ready";
+        // 確認文で解決したプロジェクト名を通知でも使えるよう保存する。
+        // プレースホルダ（「（候補から選択）」「未設定…」）は実名でないので除外。
+        const cleanProjectName =
+          projectDisplay && !projectDisplay.startsWith("（") && !projectDisplay.startsWith("未設定")
+            ? projectDisplay
+            : newTask.project || null;
         // Build task display block with description inline
         const label = result.new_tasks.length > 1 ? `【タスク${i + 1}】\n` : "";
         const lines = [
           `${label}・タスク名: *${newTask.task_name}*`,
           `・担当: ${newTask.assignee}`,
-          `・期限: ${newTask.due}`,
+          `・期限: ${formatDueForDisplay(newTask.due)}`,
           `・SP: ${newTask.sp}`,
-          `・ステータス: ${newTask.status ?? "Backlog"}`
+          `・ステータス: ${taskStatus}`
         ];
         lines.push(`・プロジェクト: ${projectDisplay ? `*${projectDisplay}*` : "未設定"}`);
         lines.push(`・スプリント: ${sprintDisplay ?? "未設定"}`);
@@ -1293,8 +1345,10 @@ async function handleMention(
           task_name: newTask.task_name,
           new_value: JSON.stringify({
             ...newTask,
+            status: taskStatus,
+            project: cleanProjectName,
             ...(resolvedSprintId ? { sprintId: resolvedSprintId } : {}),
-            sprintName: newTask.sprint,
+            sprintName: resolvedSprintName,
             projectIds: resolvedProjectIds,
             ...(taskDescription ? { description: taskDescription } : {}),
             relevantUrls: result.relevant_urls ?? []
@@ -1304,23 +1358,28 @@ async function handleMention(
 
       const responseText = `以下のタスクを追加します。問題なければ ✅ 承認ボタンを押してください:\n\n${taskBlocks.join("\n\n")}`;
 
-      // ── 聞き返し①: 担当者が未解決（単一タスク）→ @メンション/名前で再指定を依頼 ──
-      // taskActions を pending として保存しておけば、スレッド返信が handleMention に
-      // 再投入され、pending_create_tasks 経由で担当者がマージ→再解決される。
+      // ── 担当者が未解決（単一タスク）でも、承認ボタンは出して起票できるようにする ──
+      // 「名前を返信すれば担当者を設定」「このまま承認すれば担当者未定で起票」を選べる。
+      // (スレッド返信は pendingCreateRef 経由で handleMention に再投入され担当者が再解決される)
       if (assigneeNeedsHearing) {
-        const askText =
-          `${userMention}このタスクの担当者を特定できませんでした 🙇\n` +
-          `担当者を @メンション するか、お名前で教えてください。\n\n${responseText}`;
-        const askMsg = await chatPostMessage(config.slackBotToken, channel, askText, undefined, threadTs);
-        await savePendingAction(env.NOTIFY_CACHE, askMsg.channel, askMsg.ts, {
+        const hint =
+          "_担当者が未特定です。@メンション か お名前を返信すると担当者を設定できます。" +
+          "このまま ✅ 承認すると担当者未定のまま起票します。_";
+        const createBlocks = [
+          { type: "section", text: { type: "mrkdwn", text: `${userMention}${responseText}` } },
+          { type: "section", text: { type: "mrkdwn", text: hint } },
+          ...buildApprovalButtons("task_action")
+        ];
+        const confirmMsg = await chatPostMessage(config.slackBotToken, channel, `${userMention}${responseText}`, createBlocks, threadTs);
+        await savePendingAction(env.NOTIFY_CACHE, confirmMsg.channel, confirmMsg.ts, {
           actions: taskActions,
           requestedBy: userId,
           requestedAt: new Date().toISOString(),
           threadTs
         });
-        await savePendingCreateRef(env.NOTIFY_CACHE, channel, threadTs, { confirmMsgTs: askMsg.ts });
-        await appendMentionHistory(env.NOTIFY_CACHE, channel, threadTs, userText, askText);
-        console.log(`Assignee hearing asked: task="${result.new_tasks[0].task_name}", ts=${askMsg.ts}`);
+        await savePendingCreateRef(env.NOTIFY_CACHE, channel, threadTs, { confirmMsgTs: confirmMsg.ts });
+        await appendMentionHistory(env.NOTIFY_CACHE, channel, threadTs, userText, responseText);
+        console.log(`Assignee unresolved: posted confirmation WITH buttons (担当者未定可), ts=${confirmMsg.ts}`);
         return;
       }
 

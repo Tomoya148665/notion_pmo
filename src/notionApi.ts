@@ -318,6 +318,8 @@ interface TaskRow {
   url?: string | null;
   assignees: string[];
   projectIds: string[];
+  /** ページ作成日(JST, YYYY-MM-DD)。当日作成タスク判定に使う。 */
+  createdTime: string | null;
 }
 
 const extractSprintInfo = (
@@ -434,7 +436,7 @@ function abbreviateProjectName(name: string): string {
   return name.slice(0, 1);
 }
 
-const extractTaskRow = (page: any): TaskRow | null => {
+const extractTaskRow = (page: any, opts: { includeCompleted?: boolean } = {}): TaskRow | null => {
   const props = page?.properties ?? {};
   const name = getTitleFromProperties(props, ["名前", "Name"]);
   const url = typeof page?.url === "string" ? page.url : null;
@@ -455,7 +457,14 @@ const extractTaskRow = (page: any): TaskRow | null => {
       : undefined);
 
   const status = getStatusName(statusProp) ?? null;
-  if (isCompletedStatus(status)) return null;
+  // 通常は完了タスクを除外する。includeCompleted のときだけ完了タスクも返す（進捗サマリー用）。
+  if (!opts.includeCompleted && isCompletedStatus(status)) return null;
+
+  // ページ作成日を JST(YYYY-MM-DD) に変換（created_time は UTC ISO）
+  const createdTime =
+    typeof page?.created_time === "string"
+      ? new Date(new Date(page.created_time).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10)
+      : null;
 
   const priority = getStatusName(priorityProp) ?? null;
   const sp =
@@ -464,7 +473,8 @@ const extractTaskRow = (page: any): TaskRow | null => {
     asNumber(props?.["Story Points"]);
   const dueProp = getPropertyByName(props, ["期限", "Due", "Due Date"]);
   const dueDate = getDateValue(dueProp);
-  const due = normalizeDateString(dueDate?.start ?? dueDate?.end) ?? null;
+  // 期限がレンジ(開始 → 終了)の場合、締切は「終了日」。単日ならその日。
+  const due = normalizeDateString(dueDate?.end ?? dueDate?.start) ?? null;
   // 期限がレンジ(開始〜終了)の場合の終端 = 期日。単日なら null。
   const dueEnd = normalizeDateString(dueDate?.end) ?? null;
 
@@ -507,7 +517,8 @@ const extractTaskRow = (page: any): TaskRow | null => {
     company,
     url,
     assignees,
-    projectIds: taskProjectIds
+    projectIds: taskProjectIds,
+    createdTime
   };
 };
 
@@ -708,9 +719,10 @@ export async function fetchCurrentSprintTasksSummary(
  */
 export async function fetchTasksByDueRange(
   config: AppConfig,
-  startDate: string,
+  startDate: string | null,
   endDate: string,
-  dueProperty = "期限"
+  dueProperty = "期限",
+  opts: { includeNoDue?: boolean; includeCompleted?: boolean } = {}
 ): Promise<{ assignees: SprintTasksSummary["assignees"] }> {
   const taskDbId = await resolveDatabaseId(config, {
     url: config.taskDbUrl,
@@ -718,18 +730,23 @@ export async function fetchTasksByDueRange(
     label: "TASK_DB"
   });
 
+  // Notion は1つの date 条件に on_or_after と on_or_before を同時指定できない。
+  // 両端で絞るには and 複合フィルタにする必要がある。
+  // startDate=null のときは下限なし(=過去の期限切れを全部含む)。
+  const dateConds: any[] = [];
+  if (startDate) dateConds.push({ property: dueProperty, date: { on_or_after: startDate } });
+  dateConds.push({ property: dueProperty, date: { on_or_before: endDate } });
+  const rangeFilter = dateConds.length > 1 ? { and: dateConds } : dateConds[0];
+  // includeNoDue=true のときは「期限が範囲内 OR 期限未設定」を対象にする。
+  const filter = opts.includeNoDue
+    ? { or: [rangeFilter, { property: dueProperty, date: { is_empty: true } }] }
+    : rangeFilter;
+
   const taskPages = await queryDatabase(
     config,
     taskDbId,
     {
-      // Notion は1つの date 条件に on_or_after と on_or_before を同時指定できない。
-      // 両端で絞るには and 複合フィルタにする必要がある。
-      filter: {
-        and: [
-          { property: dueProperty, date: { on_or_after: startDate } },
-          { property: dueProperty, date: { on_or_before: endDate } }
-        ]
-      },
+      filter,
       sorts: [{ property: dueProperty, direction: "ascending" }]
     },
     10
@@ -737,7 +754,7 @@ export async function fetchTasksByDueRange(
 
   const tasks: TaskRow[] = [];
   for (const page of taskPages) {
-    const task = extractTaskRow(page); // 完了タスクは null になる
+    const task = extractTaskRow(page, { includeCompleted: opts.includeCompleted }); // 既定では完了タスクは null
     if (task) tasks.push(task);
   }
 
@@ -761,7 +778,7 @@ export async function fetchTasksByDueRange(
     }
   }
 
-  console.log(`fetchTasksByDueRange: ${tasks.length} tasks in ${startDate}~${endDate} across ${assignees.length} assignees`);
+  console.log(`fetchTasksByDueRange: ${tasks.length} tasks in ${startDate ?? "(下限なし)"}~${endDate}${opts.includeNoDue ? "+期限なし" : ""} across ${assignees.length} assignees`);
   return { assignees };
 }
 
@@ -796,7 +813,8 @@ export async function fetchSprintBurndownTasks(
     const completedDate = normalizeDateString(getDateValue(doneProp)?.start) ?? null;
     const dueProp = getPropertyByName(props, ["期限", "Due", "Due Date"]);
     const dueVal = getDateValue(dueProp);
-    const due = normalizeDateString(dueVal?.start ?? dueVal?.end) ?? null;
+    // レンジ期限は終了日が締切
+    const due = normalizeDateString(dueVal?.end ?? dueVal?.start) ?? null;
     return { sp: sp ?? 0, status, completedDate, due };
   });
 }
@@ -1086,7 +1104,8 @@ export async function fetchTaskPropertiesById(
     const status = getStatusName(getPropertyByName(props, ["ステータス", "Status"])) ?? null;
     const assignees = getPeopleNames(getPropertyByName(props, ["担当者", "Assignee"]));
     const dateVal = getDateValue(getPropertyByName(props, ["期限", "Due", "期間"]));
-    const due = dateVal?.start ?? null;
+    // レンジ期限は終了日が締切。snapshot 等と桁を揃えるため YYYY-MM-DD に正規化。
+    const due = normalizeDateString(dateVal?.end ?? dateVal?.start) ?? null;
     const sp = asNumber(getPropertyByName(props, ["SP", "sp"]));
     return { name, status, assignees, due, sp };
   } catch (err) {

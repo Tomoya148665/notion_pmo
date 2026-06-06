@@ -389,11 +389,36 @@ export interface TaskSnapshot {
   assignees: string[];
   due: string | null;
   sp: number | null;
+  // これまでに計上済みの進捗率の最高値(0〜1)。一時停止(Pending/他者ボール等で0%)を挟んでも
+  // 既に出した進捗分を二重計上しないための基準。例: 60%→他者ボール→完了 の差分は +40%。
+  peakRate?: number;
 }
 
 const TASK_SNAPSHOT_KEY = (pageId: string) => `task-snapshot:${pageId.replace(/-/g, "")}`;
 // 当日スレッド + 翌朝まで通知できるよう 2 日保持
 const SNAPSHOT_TTL = 2 * 24 * 3600;
+
+// ── タスク作成の冪等化 ──────────────────────────────────────────────────────
+// 同一スレッドで訂正リプライを連投すると、承認ボタン付きの確認が複数並存し、
+// それぞれ承認すると Notion に二重作成される。スレッド+タスク名で短時間ロックして防ぐ。
+const CREATE_DEDUP_TTL = 10 * 60; // 10 分
+/**
+ * 同一スレッド+タスク名の作成を初めて要求したときだけ true を返す（=作成を許可）。
+ * 既にロック済み（直近に作成済み）なら false（=重複なのでスキップ）。
+ */
+export async function claimTaskCreation(
+  kv: KVNamespace,
+  channel: string,
+  threadKey: string,
+  taskName: string
+): Promise<boolean> {
+  const norm = taskName.normalize("NFKC").trim().toLowerCase();
+  const key = `create-dedup:${channel}:${threadKey}:${norm}`;
+  const existing = await kv.get(key);
+  if (existing) return false;
+  await kv.put(key, "1", { expirationTtl: CREATE_DEDUP_TTL });
+  return true;
+}
 
 export async function saveTaskSnapshot(
   kv: KVNamespace,
