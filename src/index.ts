@@ -151,6 +151,11 @@ type TaskTableRow = { name: string; project: string; status: string; priority: s
 // 24時サマリー用（ステータス差分・進捗SP表示）
 type ProgressTableRow = { name: string; project: string; statusDiff: string; spText: string };
 
+/** タスク一覧の非表示判定: 完了 or 中止 は一覧に出さない（Pending/他者ボール/Backlog は表示）。 */
+function isHiddenFromList(status: string | null | undefined): boolean {
+  return isCompletedStatus(status) || /中止|キャンセル|cancel/i.test(status ?? "");
+}
+
 /** "doing(60%)" → "60%" に簡略化（doing 接頭辞を除去）。完了等はそのまま。 */
 function simplifyStatus(status: string | null | undefined): string {
   if (!status) return "-";
@@ -226,7 +231,7 @@ function renderProgressTable(rows: ProgressTableRow[]): string {
 
 /** 定期送信用: Notion タスク1件を表示行に変換（ステータスは doing(N%)→N% に簡略化）。 */
 function taskToTableRow(task: {
-  name: string; status?: string | null; priority?: string | null; sp?: number | null; due?: string | null; projectName?: string | null;
+  name: string; status?: string | null; priority?: string | null; sp?: number | null; due?: string | null; dueTime?: string | null; projectName?: string | null;
 }, today?: string, reason?: string): TaskTableRow {
   return {
     name: task.name,
@@ -234,7 +239,8 @@ function taskToTableRow(task: {
     status: simplifyStatus(task.status),
     priority: task.priority ?? "-",
     sp: task.sp != null ? String(task.sp) : "-",
-    due: task.due ? formatShortDate(task.due) : "-",
+    // 期日に時刻があれば "M/D HH:MM"、無ければ "M/D"
+    due: task.due ? formatShortDate(task.due) + (task.dueTime ? ` ${task.dueTime}` : "") : "-",
     alert: today ? deadlineAlert(task.due, today, task.status, reason) : ""
   };
 }
@@ -273,7 +279,7 @@ function formatDeadlineTasksTable(
 
   for (const assignee of summary.assignees) {
     for (const task of assignee.tasks) {
-      if (task.status && isCompletedStatus(task.status)) continue;
+      if (isHiddenFromList(task.status)) continue;
       if (!task.due) continue;
       const dueDate = new Date(task.due + "T00:00:00Z");
       const daysRemaining = Math.ceil(
@@ -393,7 +399,7 @@ function buildPerMemberTaskTables(
   for (const assignee of assignees) {
     if (assignee.name === "未割当") continue; // 担当者なしのタスクはリマインド対象外
     const rows = assignee.tasks
-      .filter((t) => !isCompletedStatus(t.status))
+      .filter((t) => !isHiddenFromList(t.status))
       .map((t) => taskToTableRow(t, today, reason));
     if (rows.length === 0) continue;
     result.push({ assigneeName: assignee.name, tableText: renderTaskTable(rows) });
@@ -1276,7 +1282,7 @@ async function runTaskReminderFlow(
     const unassignedGrp = dueRange.assignees.find((a) => a.name === "未割当");
     if (unassignedGrp) {
       const rows = unassignedGrp.tasks
-        .filter((t) => !isCompletedStatus(t.status))
+        .filter((t) => !isHiddenFromList(t.status))
         .map((t) => taskToTableRow(t, today, reason));
       if (rows.length > 0) {
         await chatPostMessage(
@@ -1461,7 +1467,7 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
   const unassignedGrp = listRange.assignees.find((a) => a.name === "未割当");
   if (unassignedGrp) {
     const rows = unassignedGrp.tasks
-      .filter((t) => !isCompletedStatus(t.status))
+      .filter((t) => !isHiddenFromList(t.status))
       .map((t) => taskToTableRow(t, todayActual, reason));
     if (rows.length > 0) {
       await chatPostMessage(
@@ -2456,7 +2462,7 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
             mentionResolved: !!catalogSlackId,
             catalogSlackId,
             legacySlackId,
-            taskCount: a.tasks.filter((t) => !isCompletedStatus(t.status)).length
+            taskCount: a.tasks.filter((t) => !isHiddenFromList(t.status)).length
           };
         });
       // 生の日付プロパティをダンプ（実行日→期日のレンジがどのプロパティかを特定）
@@ -2489,7 +2495,7 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
         .flatMap((a) => {
           const member = resolveMemberByName(userCatalog, a.name);
           const surname = member?.name ?? a.name.split(/[｜|/／\s]/)[0];
-          return a.tasks.filter((t) => !isCompletedStatus(t.status) && t.due).map((t) => ({
+          return a.tasks.filter((t) => !isHiddenFromList(t.status) && t.due).map((t) => ({
             name: t.name, assignee: surname, status: t.status ?? "",
             project: t.projectName ? abbreviateProject(t.projectName) : "",
             start: t.startDate ?? (t.due as string), end: t.dueEnd ?? (t.due as string), sp: t.sp ?? null

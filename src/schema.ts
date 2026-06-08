@@ -77,6 +77,7 @@ export const sprintTasksSchema = z.object({
           sp: z.number().optional().nullable(),
           due: z.string().optional().nullable(),
           dueEnd: z.string().optional().nullable(),
+          dueTime: z.string().optional().nullable(),
           startDate: z.string().optional().nullable(),
           category: z.string().optional().nullable(),
           subItem: z.string().optional().nullable(),

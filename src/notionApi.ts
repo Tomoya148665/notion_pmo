@@ -110,6 +110,14 @@ const normalizeDateString = (value?: string | null): string | undefined => {
   return value.slice(0, 10);
 };
 
+/** ISO 日時文字列に時刻が含まれていれば JST の "HH:MM" を返す。日付のみ(時刻なし)は null。 */
+const extractTimeJst = (value?: string | null): string | null => {
+  if (!value || !value.includes("T")) return null;
+  const ms = new Date(value).getTime();
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms + 9 * 3600 * 1000).toISOString().slice(11, 16);
+};
+
 const titleFromRichText = (items: any): string => {
   if (!Array.isArray(items)) return "";
   return items.map((item) => item?.plain_text ?? "").join("").trim();
@@ -311,6 +319,7 @@ interface TaskRow {
   sp: number | null;
   due: string | null;
   dueEnd: string | null;
+  dueTime: string | null;
   startDate: string | null;
   category: string | null;
   subItem: string | null;
@@ -477,6 +486,8 @@ const extractTaskRow = (page: any, opts: { includeCompleted?: boolean } = {}): T
   const due = normalizeDateString(dueDate?.end ?? dueDate?.start) ?? null;
   // 期限がレンジ(開始〜終了)の場合の終端 = 期日。単日なら null。
   const dueEnd = normalizeDateString(dueDate?.end) ?? null;
+  // 期日に時刻が含まれる場合の時刻(JST "HH:MM")。日付のみなら null。
+  const dueTime = extractTimeJst(dueDate?.end ?? dueDate?.start);
 
   const assignees = getPeopleNames(assigneeProp);
 
@@ -511,6 +522,7 @@ const extractTaskRow = (page: any, opts: { includeCompleted?: boolean } = {}): T
     sp,
     due,
     dueEnd,
+    dueTime,
     startDate,
     category,
     subItem,
@@ -568,6 +580,7 @@ const groupTasksByAssignee = (
         sp: task.sp ?? null,
         due: task.due ?? null,
         dueEnd: task.dueEnd ?? null,
+        dueTime: task.dueTime ?? null,
         startDate: task.startDate ?? null,
         category: task.category ?? null,
         subItem: task.subItem ?? null,
