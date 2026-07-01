@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "loop:audit": "npx -y @cobusgreyling/loop-audit . --suggest",
+    "loop:cost": "npx -y @cobusgreyling/loop-cost --pattern daily-triage --level L1"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.1.0",
