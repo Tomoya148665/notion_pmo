@@ -479,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     print(f"[shell-loop-notion] completed {completed}/{len(selected_tasks)} tasks")
+    if args.dry_run:
+        return 0
     return 0 if completed == len(selected_tasks) else 2
 
 
