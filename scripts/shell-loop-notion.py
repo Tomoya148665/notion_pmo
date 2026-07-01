@@ -277,6 +277,26 @@ def run_log_toggle(
     return toggle("実行ログ", [paragraph(line) for line in lines])
 
 
+def run_log_lines(
+    *,
+    status: str,
+    run_id: str,
+    run_dir: Path,
+    rc: int | None,
+    summary: str,
+) -> list[str]:
+    lines = [
+        f"Status: {status}",
+        f"Run ID: {run_id}",
+        f"Run directory: {run_dir}",
+    ]
+    if rc is not None:
+        lines.append(f"Exit code: {rc}")
+    if summary:
+        lines.append(f"Summary: {summary}")
+    return lines
+
+
 def append_result(
     client: NotionClient,
     task_toggle_id: str,
@@ -288,13 +308,22 @@ def append_result(
     rc: int | None,
     summary: str,
 ) -> None:
-    client.append_children(
+    created = client.append_children(
         task_toggle_id,
         [
             *paragraphs(output_text),
-            run_log_toggle(status=status, run_id=run_id, run_dir=run_dir, rc=rc, summary=summary),
+            toggle("実行ログ"),
         ],
     )
+    log_toggle = next((block for block in created.get("results", []) if block.get("type") == "toggle"), None)
+    if log_toggle:
+        client.append_children(
+            log_toggle["id"],
+            [
+                paragraph(line)
+                for line in run_log_lines(status=status, run_id=run_id, run_dir=run_dir, rc=rc, summary=summary)
+            ],
+        )
 
 
 def make_run_id(index: int) -> str:

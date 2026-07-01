@@ -32,9 +32,10 @@ class FakeNotionClient:
         return {
             "results": [
                 {
-                    "id": "created-result",
-                    **children[0],
+                    "id": f"created-result-{index}",
+                    **child,
                 }
+                for index, child in enumerate(children)
             ]
         }
 
@@ -190,13 +191,14 @@ RALPH_LOOP_END
             summary="summary",
         )
 
-        block_id, children = client.appended[-1]
+        block_id, children = client.appended[0]
         self.assertEqual(block_id, "task-toggle")
         self.assertEqual(children[0]["type"], "paragraph")
         self.assertEqual(shell_loop.block_text(children[0]), "実際のアウトプット")
         self.assertEqual(children[1]["type"], "toggle")
         self.assertEqual(shell_loop.block_text(children[1]), "実行ログ")
-        log_children = children[1]["toggle"]["children"]
+        log_block_id, log_children = client.appended[1]
+        self.assertEqual(log_block_id, "created-result-1")
         self.assertEqual([shell_loop.block_text(child) for child in log_children], [
             "Status: Done",
             "Run ID: run-1",
