@@ -41,6 +41,10 @@ jobs:
         run: |
           echo "$HOME/.local/node-v24.13.0/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/tmp"
+          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+          echo "TEMP=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
 
       - name: Check runner prerequisites
         run: |
@@ -49,6 +53,9 @@ jobs:
           command -v node
           command -v npm
           command -v codex
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Run next Notion task
         run: |

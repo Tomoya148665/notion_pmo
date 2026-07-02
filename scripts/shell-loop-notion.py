@@ -414,8 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         task_toggle = ensure_task_toggle(client, result_toggle["id"], task, result_children)
         result_children.append(task_toggle)
         status = "" if args.include_completed else task_result_status(client, task_toggle["id"])
-        if status == "Done":
-            print(f"[shell-loop-notion] skip completed task: {task.text}", flush=True)
+        if status in {"Done", "Blocked"}:
+            print(f"[shell-loop-notion] skip {status.lower()} task: {task.text}", flush=True)
             continue
         selected_tasks.append((task, task_toggle))
         if args.limit and len(selected_tasks) >= args.limit:
@@ -429,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     state_root = workdir / (".claude" if "claude" in runner_stem else ".codex") / runner_stem
 
     completed = 0
+    handled = 0
     for index, (task, task_toggle) in enumerate(selected_tasks, start=1):
         run_id = make_run_id(index)
         run_dir = state_root / run_id
@@ -466,22 +467,26 @@ def main(argv: list[str] | None = None) -> int:
                 summary=result.summary,
             )
             completed += 1
+            handled += 1
         else:
+            status = "Blocked" if result.status == "blocked" else "Failed"
             append_result(
                 client,
                 task_toggle["id"],
                 output_text=output_text,
-                status="Blocked" if result.status == "blocked" else "Failed",
+                status=status,
                 run_id=run_id,
                 run_dir=run_dir,
                 rc=rc,
                 summary=result.summary or f"runner rc={rc}",
             )
+            if status == "Blocked":
+                handled += 1
 
     print(f"[shell-loop-notion] completed {completed}/{len(selected_tasks)} tasks")
     if args.dry_run:
         return 0
-    return 0 if completed == len(selected_tasks) else 2
+    return 0 if handled == len(selected_tasks) else 2
 
 
 if __name__ == "__main__":
