@@ -1,0 +1,20 @@
+# Claude Code — 配布先リポジトリで .claude/ が既にignoreされている場合に
+# skills/ と settings.json を確実にtrackさせるための否定パターン。
+# このテンプレートを適用する際、対象リポジトリの .gitignore に
+# .claude/* が含まれていると skills がcommitできなくなるため、
+# 否定ルール (!.claude/skills/) で上書きして回避する。
+.claude/*
+!.claude/skills/
+!.claude/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (GitHub Actions開発用)
+node_modules/
+
+# Environment variables
+.env
+.env.*
+!.env.example
