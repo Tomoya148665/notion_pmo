@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config";
+import { withOptionalTemperature } from "./openaiCompat";
 import type { SprintTasksSummary, MentionContext } from "./schema";
 import type { ReferenceItem } from "./notionApi";
 import { toJstDateString, type MentionMessage } from "./workflow";
@@ -23,7 +24,13 @@ import {
   notionUpdateActionsJsonSchema,
   mentionIntentJsonSchema,
   taskScheduleMappingJsonSchema,
-  replyEvaluationJsonSchema
+  replyEvaluationJsonSchema,
+  kpiCadenceSchema,
+  kpiCadenceJsonSchema,
+  kpiReplyJudgmentSchema,
+  kpiReplyJudgmentJsonSchema,
+  type KpiCadenceLlmResult,
+  type KpiReplyJudgment
 } from "./schema";
 import type { StoredReply, ActiveThread } from "./workflow";
 import { addDays, type ScheduleData, type ScheduleRow } from "./sheetsApi";
@@ -154,10 +161,12 @@ async function callChatCompletion(
   config: AppConfig,
   systemPrompt: string,
   userPrompt: string,
-  jsonSchema: { name: string; strict: boolean; schema: unknown }
+  jsonSchema: { name: string; strict: boolean; schema: unknown },
+  opts?: { model?: string; temperature?: number }
 ): Promise<unknown> {
-  const body = {
-    model: config.openaiModel,
+  const model = opts?.model ?? config.openaiModel;
+  const body = withOptionalTemperature({
+    model,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
@@ -166,8 +175,7 @@ async function callChatCompletion(
       type: "json_schema",
       json_schema: jsonSchema
     },
-    temperature: 0.1
-  };
+  }, model, opts?.temperature ?? 0.1);
 
   let attempt = 0;
   let waitMs = 500;
@@ -902,15 +910,14 @@ ${relatedMessages.map((m) => `[${m.user}] ${m.text}`).join("\n")}
 
 上記メッセージの中からタスクに関連する情報を探し、概要を作成してください。関連するものが一つもない場合のみ「null」と返してください。`;
 
-  const body = {
+  const body = withOptionalTemperature({
     model: config.openaiModel,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
     ],
-    temperature: 0.2,
     max_tokens: 500
-  };
+  }, config.openaiModel, 0.2);
 
   let attempt = 0;
   let waitMs = 500;
@@ -938,6 +945,299 @@ ${relatedMessages.map((m) => `[${m.user}] ${m.text}`).join("\n")}
     if (attempt >= config.maxRetries) {
       console.warn(`generateTaskDescription failed after ${attempt} attempts`);
       return null; // Don't block task creation on description failure
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+    waitMs *= 2;
+  }
+}
+
+// ── KPI cadence inference ───────────────────────────────────────────────
+
+/**
+ * KPIのフリーテキスト（例:「週2回」「火・金に…」「3アポと復習」「ケース問題を朝1題やる」）から、
+ * 曜日・頻度の構造化情報を推論する。1KPIあたり1回だけ呼び出し、結果は呼び出し側でキャッシュする。
+ */
+export async function inferKpiCadence(
+  config: AppConfig,
+  member: string,
+  kpiText: string,
+  skillCategory?: string | null
+): Promise<KpiCadenceLlmResult> {
+  const systemPrompt = `あなたはPMOアシスタントです。チームメンバーが自分で設定した「KPI（個人目標）」のテキストを読み、
+実行すべき頻度・曜日を構造化してください。
+
+■ kind の判定基準:
+- "weekdays": 特定の曜日が明示されている（例:「火・金に」「毎週月曜」）→ weekdays に該当曜日（0=日,1=月,2=火,3=水,4=木,5=金,6=土）を配列で入れる
+- "weekly_count": 週あたりの回数目標が明示されている（例:「週2回」「3アポと復習」「毎日いいサイトを1つ」は毎日なのでdailyだが「週3回発信する」はweekly_count）→ count_per_week に数値、count_unit に単位（例:"回","アポ"）
+- "daily": 曜日指定はないが「毎日」「1日1問」等、実質毎日行うことが明確なもの
+- "none": 頻度や曜日が読み取れない・不明瞭（例:「〇〇を理解する」のような状態目標、期日未定の一回きりのタスク）
+- 判定に迷う場合は confidence を "low" にしつつ、最も近いkindを選ぶ（noneは本当に手がかりが無い時のみ）
+- rationale は判定理由を一言（20〜40字程度）で
+
+日本語で回答してください。`;
+
+  const userPrompt = JSON.stringify({
+    member,
+    kpi_text: kpiText,
+    skill_category: skillCategory ?? null
+  });
+
+  const raw = await callChatCompletion(config, systemPrompt, userPrompt, kpiCadenceJsonSchema, {
+    model: config.kpiOpenaiModel
+  });
+  return kpiCadenceSchema.parse(raw);
+}
+
+// ── KPI grilling: judge a reply and decide the next message ─────────────
+
+interface KpiHistoryForLlm {
+  kpiText: string;
+  commitments: Array<{ committedDate: string; what: string; fulfilled: string }>;
+  excuses: Array<{ excuseText: string; givenAt: string }>;
+  contextNotes: Array<{ note: string; recordedAt: string }>;
+}
+
+interface KpiRiskItemForLlm {
+  itemKey: string;
+  kpiText: string;
+  triggerKind: string;
+  detail: string;
+}
+
+/** 当日のこれまでのやり取り（Bot⇔本人）。二度聞き・文脈喪失を防ぐためLLMに渡す。 */
+export interface KpiConversationForLlm {
+  role: "bot" | "member" | string;
+  text: string;
+}
+
+/** Notion表の現在値（返信時点で再取得した最新状態）。検知時のdetailは古い可能性があるためこちらを優先する。 */
+export interface KpiCurrentStateForLlm {
+  itemKey: string;
+  kpiText: string;
+  /** 今週の日付列ごとのセル値（今日まで）。 */
+  cells: Array<{ label: string; value: string }>;
+  /** weekly_count型のみ: ペース計算に必要な数値。 */
+  weekly?: { countPerWeek: number; doneSoFar: number; daysRemainingIncludingToday: number };
+}
+
+/** JST現在時刻を "YYYY-MM-DD HH:mm (X曜)" 形式で返す（LLMの「今日中」「25時」解釈用）。 */
+function nowJstLabel(): string {
+  const jst = new Date(Date.now() + 9 * 3600 * 1000);
+  const dow = "日月火水木金土"[jst.getUTCDay()];
+  return `${jst.toISOString().slice(0, 16).replace("T", " ")} (${dow}曜)`;
+}
+
+/**
+ * KPI未達成についてスレッドでフォロー中、相手の返信を判定する。
+ * 当日の会話履歴(conversation)と表の最新値(currentState)を文脈として渡し、
+ * 「納得のいく回答」か（具体的な新しい約束・妥当な完了報告・正当な理由）を判定して、
+ * 満足したitemKeyだけを切り分け、次にBotが返す文面も同時に生成する。
+ */
+export async function evaluateKpiReply(
+  config: AppConfig,
+  params: {
+    member: string;
+    replyText: string;
+    items: KpiRiskItemForLlm[];
+    history: KpiHistoryForLlm[];
+    pressCount: number;
+    conversation?: KpiConversationForLlm[];
+    currentState?: KpiCurrentStateForLlm[];
+  }
+): Promise<KpiReplyJudgment> {
+  const { member, replyText, items, history, pressCount, conversation, currentState } = params;
+
+  const systemPrompt = `あなたは「土方十四郎」というPMOアシスタントBotです。チームのKPI（個人目標）の実行状況をSlackスレッドで確認し、
+納得のいく回答が得られるまで自然な会話でフォローする役割です。
+
+■ 最重要: 会話として成立させること
+- conversation（当日のこれまでのやり取り）を必ず読み、文脈を引き継ぐこと。既に答えてもらった内容を二度聞きしない
+- 短い返事の解釈ルール:
+  - 会話の中に既に具体的な日時・計画が出ていて、それへの同意（「はーい」「いよ」「了解」）→ その内容での約束成立とみなす
+    例: 本人「23時にやります」→Bot「AとBを23時にですね」→本人「はーい」→ AとB両方が23時の約束で成立
+  - まだ「いつ」が会話のどこにも出ていない状態での「やります」「はい」だけ → 未解決のまま。ただし返す文面は短く自然に（「いつ頃やる予定？」程度）。長い説教や一覧の再掲はしない
+- 単独では曖昧な発言でも、会話の流れから対象・日時が特定できれば具体的な回答として扱う
+- 前回のBot発言と同じ構成・同じ言い回しの文面を繰り返さない
+- response_textは1〜4文程度の自然な会話文。KPIの一覧や状況の再掲を毎回しない
+- 運用メタ情報（「18時/21時のチェックで様子を見ます」「次のチェックで確認します」等）は書かない
+
+■ 事実の扱い
+- current_state はNotion表の現在値（返信時点で再取得した最新）。items内のdetailは検知時点の古い情報なので、数値はcurrent_stateを優先する
+- 本人が会話で「やった」と報告した内容は、表が未記入でも信じる。その場合は表への記入を一言お願いする
+- now（現在日時JST）を基準に「今日中」「明日」等を解釈する。過ぎた時刻の予定の話をしない
+
+■ weekly_count型（週N回）の判定 — 重要
+- 求めるのは「週の残り日数で残り回数が現実的に収まる状態」であって、今日中に週全体を終わらせることではない
+- 例: 週6回・今日1回実施報告・残り5日 → 残り5回を5日でやれば達成可能 = ペース内 → この報告はsatisfiedにしてよい
+- current_state.weekly の countPerWeek / doneSoFar / daysRemainingIncludingToday と本人の報告を合算して計算すること
+- Notion表の単独数値（例: "1"）は、その週の実施回数の累計という実績記録。"1を書いている"と言われたら、未記入・未着手とは絶対に扱わない。current_state と history の context_notes を優先して、認識した実績数を自然に返答へ含めること
+- ペースが数学的に不可能な場合のみ、どうリカバリするかを聞く
+
+■ satisfied（解決）の基準
+- 実行済みの報告（口頭でも可）
+- 具体的な実行予定（会話の文脈から日時・対象が特定できればよい）
+- 妥当な理由（体調不良・緊急対応等）
+- weekly_count型でペース内に収まる報告・計画
+- 「25時にやる」等の深夜表現は「今夜（当日の夜遅く）やる」という意味の約束として受け入れる。時刻の定義について説教しない
+
+■ 未解決のままにする基準
+- 会話の文脈を踏まえても、何をいつやるのか特定できない
+- 過去と同じ言い訳の繰り返し（historyを確認。ただし指摘の言い回しは毎回変える）
+
+■ 相手への配慮
+- 「しぬ」「無理」「もうだめ」等、疲弊・苦痛のサインが出たら詰めるのをやめること。共感を一言示し、最小の一歩（5分だけ・1問だけ等）を提案する。resolvedにはしないが、トーンは大きく和らげる
+- 冗談やスタンプ的な返し（「:草:」等）には軽く一言で返す。長文の説教をしない
+- press_count が5以上の場合も同様にトーンを和らげ、追い込まない
+
+■ 構造化出力
+- satisfied_item_keys: 今回の返信（会話文脈込み）で解決したitemのitemKeyのみ
+- extracted_commitment: 新しい「いつやる」約束があれば {date, what, item_keys}。dateはYYYY-MM-DD、nowの日付を基準に相対表現を変換（年もnowと同じ）。「今夜」「25時」等は当日の日付にする。item_keysはその約束が対象とするitemだけ（会話文脈から特定。直前のBot発言で挙げた複数itemへの返事なら、その全部）
+- extracted_excuse: 未達成の理由があれば {text, item_keys}
+- response_text: Slackにそのまま投稿する自然な返信
+
+日本語で回答してください。`;
+
+  const userPrompt = JSON.stringify({
+    now: nowJstLabel(),
+    member,
+    reply: replyText,
+    press_count: pressCount,
+    conversation: (conversation ?? []).map((c) => ({ role: c.role, text: c.text })),
+    items: items.map((i) => ({
+      item_key: i.itemKey,
+      kpi_text: i.kpiText,
+      trigger_kind: i.triggerKind,
+      flagged_detail: i.detail
+    })),
+    current_state: (currentState ?? []).map((s) => ({
+      item_key: s.itemKey,
+      kpi_text: s.kpiText,
+      cells_this_week: s.cells,
+      ...(s.weekly
+        ? {
+            weekly: {
+              count_per_week: s.weekly.countPerWeek,
+              done_so_far: s.weekly.doneSoFar,
+              days_remaining_including_today: s.weekly.daysRemainingIncludingToday
+            }
+          }
+        : {})
+    })),
+    history: history.map((h) => ({
+      kpi_text: h.kpiText,
+      recent_commitments: h.commitments,
+      recent_excuses: h.excuses,
+      context_notes: h.contextNotes
+    }))
+  });
+
+  const raw = await callChatCompletion(config, systemPrompt, userPrompt, kpiReplyJudgmentJsonSchema, {
+    model: config.kpiOpenaiModel,
+    temperature: 0.4
+  });
+  return kpiReplyJudgmentSchema.parse(raw);
+}
+
+// ── KPI nudge generation (opening / escalating message, no reply yet) ────
+
+/**
+ * KPIが未着手・危険水域のメンバーに最初に投げる質問、または18時/21時のエスカレーション文面を生成する。
+ * 構造化出力は不要な自由文生成のため、generateTaskDescription と同じ軽量fetchパターンを使う。
+ */
+export async function generateKpiNudge(
+  config: AppConfig,
+  params: {
+    member: string;
+    items: KpiRiskItemForLlm[];
+    history: KpiHistoryForLlm[];
+    timeSlot: "morning" | "midday" | "evening";
+    conversation?: KpiConversationForLlm[];
+    hasReplied?: boolean;
+  }
+): Promise<string | null> {
+  const { member, items, history, timeSlot, conversation, hasReplied } = params;
+  if (items.length === 0) return null;
+
+  const timeSlotNote =
+    timeSlot === "morning"
+      ? "今は朝。まだ時間があるので「いつやる予定か」を軽やかに尋ねる。"
+      : timeSlot === "midday"
+      ? "今は昼。朝のメッセージへの返事がまだない。Notionの表を記入するよりまずこのスレッドで一言返事をもらうことを優先する。"
+      : "今は夜。今日中の見込みを確認する。過去に「今日やる」等の約束があってまだ未達成なら、その約束に具体的に触れる。";
+
+  const noReplyNote = (timeSlot !== "morning" && hasReplied === false)
+    ? `- has_replied=false: 朝（または前回）のメッセージにまだ返事がない。「まだご返事いただいていません。一言でよいので今日の取り組み状況を教えてください」という旨を冒頭に含め、スルーは次の時間帯でも追跡し続けることを示す。表の記入よりこのスレッドへの返答を最優先で求める。`
+    : "";
+
+  const systemPrompt = `あなたは「土方十四郎」というPMOアシスタントBotです。チームのKPI（個人目標）が未着手・ペース遅れ・期限切迫の
+メンバーに対して、Slackスレッドで状況を尋ねる短いメッセージを1つ生成してください。
+
+■ ルール:
+- ${timeSlotNote}
+${noReplyNote ? `- ${noReplyNote}\n` : ""}- now（現在日時JST）を踏まえること。過ぎた時刻の予定の話や、「後でチェックします」等の運用メタ情報は書かない
+- conversation（当日のこれまでのやり取り）があれば必ず引き継ぐ。既に本人が約束・回答済みの内容を無視して同じ質問をしない。
+  約束した時刻がまだ来ていないなら、その件はそっとしておくか軽い一言に留める
+- 履歴(history)に過去の約束(commitments)や言い訳(excuses)があれば具体的に言及してよい（毎回同じ言い回しにしない）
+- history の context_notes は本人が過去に説明した記録形式。必ず尊重し、特に単独数値は週内実施回数の累計実績として扱う。本人が既に記録した内容を「表に反映されていない」と言わない
+- 複数のitemは1つのメッセージに簡潔にまとめる
+- フレンドリーだが具体性を求める。has_replied=false の場合はやや直接的に返事を求めてよい
+- 2〜4行の自然な会話文。見出しや箇条書きの多用は避ける
+日本語で回答してください。`;
+
+  const userPrompt = JSON.stringify({
+    now: nowJstLabel(),
+    member,
+    time_slot: timeSlot,
+    has_replied: hasReplied ?? null,
+    ...(conversation && conversation.length > 0
+      ? { conversation: conversation.map((c) => ({ role: c.role, text: c.text })) }
+      : {}),
+    items: items.map((i) => ({
+      kpi_text: i.kpiText,
+      trigger_kind: i.triggerKind,
+      detail: i.detail
+    })),
+    history: history.map((h) => ({
+      kpi_text: h.kpiText,
+      recent_commitments: h.commitments,
+      recent_excuses: h.excuses,
+      context_notes: h.contextNotes
+    }))
+  });
+
+  const body = withOptionalTemperature({
+    model: config.kpiOpenaiModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    max_tokens: 400
+  }, config.kpiOpenaiModel, 0.5);
+
+  let attempt = 0;
+  let waitMs = 500;
+
+  while (true) {
+    attempt++;
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.openaiApiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      return data.choices?.[0]?.message?.content?.trim() || null;
+    }
+
+    if (attempt >= config.maxRetries) {
+      console.warn(`generateKpiNudge failed after ${attempt} attempts`);
+      return null;
     }
     await new Promise((r) => setTimeout(r, waitMs));
     waitMs *= 2;

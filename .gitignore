@@ -212,6 +212,20 @@ node_modules
 .wrangler/
 # Ralph Loop の状態ファイル(セッション固有・コミット不要)
 .claude/ralph-loop.local.json
+.codex/ralph-loop.local.json
+.codex/ralph-codex-loop/
 
 # Ralph Loop 定期実行のログ(コミット不要)
 logs/
+.claude/ralph-claude-loop/
+.claude/settings.local.json
+.codex/.DS_Store
+RALPH_TASKS/
+output/
+
+# OS
+.DS_Store
+
+# 個人・他案件メモ(コミット不要)
+川崎設備タスク.md
+shell-loop-task-list.md

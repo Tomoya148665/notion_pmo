@@ -1,7 +1,7 @@
 import type { Bindings } from "./config";
-import { getConfig } from "./config";
+import { getConfig, resolveTeamKChannelId } from "./config";
 import { resolveConfig } from "./channelConfig";
-import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies, bulletListBlocks } from "./slackBot";
+import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies, bulletListBlocks, viewsOpen } from "./slackBot";
 import {
   getPendingAction,
   deletePendingAction,
@@ -17,8 +17,16 @@ import {
   deletePhoneReminder,
   appendThreadCreatedTasks,
   getCurrentTaskThread,
+  saveCurrentTaskThread,
   saveTaskSnapshot,
-  claimTaskCreation
+  claimTaskCreation,
+  getDailyCheckinSession,
+  markDailyCheckinDone,
+  getSprintPlanLockSession,
+  saveSprintPlanBaseline,
+  getSprintPlanBaseline,
+  type DailyCheckinSession,
+  type DailyCheckinTask
 } from "./workflow";
 import {
   executeNotionActions,
@@ -27,7 +35,15 @@ import {
 } from "./slackEvents";
 import { ensureUserCatalog, makeAssigneeResolver, type AssigneeResolver } from "./userCatalog";
 import { interpretPmReply } from "./llmAnalyzer";
-import { fetchNotionUserMap, buildUserMapFromDatabase, appendPageContent, appendLinksToPage } from "./notionWriter";
+import {
+  fetchNotionUserMap,
+  buildUserMapFromDatabase,
+  appendPageContent,
+  appendLinksToPage,
+  updateTaskPage,
+  appendDailyUpdateLog,
+  updateTaskSprintClass
+} from "./notionWriter";
 import { fetchTaskPropertiesById } from "./notionApi";
 import type { AllocationProposal, NewTask } from "./schema";
 
@@ -132,6 +148,50 @@ export function buildEodReminderButtons(): unknown[] {
   ];
 }
 
+/** 担当者別Daily Updateモーダルを開く。 */
+export function buildDailyCheckinButton(sessionId: string): unknown[] {
+  return [
+    {
+      type: "actions",
+      block_id: "daily_checkin_buttons",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "⏱️ 30秒で更新", emoji: true },
+          style: "primary",
+          action_id: "daily_checkin_open",
+          value: sessionId
+        }
+      ]
+    }
+  ];
+}
+
+/** Sprint Planning DraftをPMが確定する。 */
+export function buildSprintPlanLockButton(sessionId: string): unknown[] {
+  return [
+    {
+      type: "actions",
+      block_id: "sprint_plan_lock_buttons",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "🔒 計画をロック", emoji: true },
+          style: "primary",
+          action_id: "sprint_plan_lock",
+          value: sessionId,
+          confirm: {
+            title: { type: "plain_text", text: "Sprint計画を確定" },
+            text: { type: "mrkdwn", text: "Commit/Stretch案をNotionへ反映し、この時点をScope baselineとして保存します。" },
+            confirm: { type: "plain_text", text: "ロックする" },
+            deny: { type: "plain_text", text: "戻る" }
+          }
+        }
+      ]
+    }
+  ];
+}
+
 /** Build time selection buttons for phone reminder */
 export function buildTimeSelectionButtons(
   userId: string,
@@ -207,6 +267,17 @@ interface SlackInteractionPayload {
   }>;
   trigger_id: string;
   response_url?: string;
+  view?: {
+    callback_id?: string;
+    private_metadata?: string;
+    state?: {
+      values?: Record<string, Record<string, {
+        type?: string;
+        value?: string;
+        selected_option?: { value?: string };
+      }>>;
+    };
+  };
 }
 
 export async function handleSlackInteractions(
@@ -275,6 +346,9 @@ export async function handleSlackInteractions(
 
   // ── Modal submissions (view_submission) ─────────────────────────────────
   if (payload.type === "view_submission") {
+    if (payload.view?.callback_id === "daily_checkin_submit") {
+      return await handleDailyCheckinSubmission(env, payload, ctx);
+    }
     return new Response("ok");
   }
 
@@ -301,6 +375,10 @@ export async function handleSlackInteractions(
     handler = handleReminderScheduleButton(env, payload, action);
   } else if (actionId === "phone_reminder_stop") {
     handler = handleReminderStopButton(env, payload, action);
+  } else if (actionId === "daily_checkin_open") {
+    handler = handleDailyCheckinOpenButton(env, payload, action);
+  } else if (actionId === "sprint_plan_lock") {
+    handler = handleSprintPlanLockButton(env, payload, action);
   }
 
   if (!handler) {
@@ -314,6 +392,319 @@ export async function handleSlackInteractions(
   });
   if (ctx) ctx.waitUntil(task);
   return new Response("");
+}
+
+// ── 30秒 Daily Update ─────────────────────────────────────────────────────
+
+function modalValue(
+  payload: SlackInteractionPayload,
+  blockId: string,
+  actionId: string
+): string {
+  const input = payload.view?.state?.values?.[blockId]?.[actionId];
+  return input?.selected_option?.value ?? input?.value ?? "";
+}
+
+function dailyCheckinModal(
+  sessionId: string,
+  tasks: Array<{ id: string; name: string; status: string | null }>
+): unknown {
+  const statusOptions = [
+    "doing(20%)",
+    "doing(40%)",
+    "doing(60%)",
+    "doing(80%)",
+    "他者ボール・レビュー中",
+    "ペンディング",
+    "完了"
+  ];
+  return {
+    type: "modal",
+    callback_id: "daily_checkin_submit",
+    private_metadata: sessionId,
+    title: { type: "plain_text", text: "30秒 Daily Update" },
+    submit: { type: "plain_text", text: "Notionへ反映" },
+    close: { type: "plain_text", text: "キャンセル" },
+    blocks: [
+      {
+        type: "input",
+        block_id: "daily_task",
+        label: { type: "plain_text", text: "更新するタスク" },
+        element: {
+          type: "static_select",
+          action_id: "task",
+          placeholder: { type: "plain_text", text: "タスクを選択" },
+          options: tasks.slice(0, 100).map((task) => ({
+            text: { type: "plain_text", text: task.name.slice(0, 75) || "(no title)" },
+            value: task.id
+          }))
+        }
+      },
+      {
+        type: "input",
+        block_id: "daily_status",
+        label: { type: "plain_text", text: "今日時点の進捗" },
+        element: {
+          type: "static_select",
+          action_id: "status",
+          options: statusOptions.map((status) => ({
+            text: { type: "plain_text", text: status },
+            value: status
+          }))
+        }
+      },
+      {
+        type: "input",
+        block_id: "daily_actual",
+        label: { type: "plain_text", text: "累積の実績工数(h)" },
+        element: {
+          type: "plain_text_input",
+          action_id: "actual",
+          placeholder: { type: "plain_text", text: "例: 6.5" }
+        }
+      },
+      {
+        type: "input",
+        block_id: "daily_remaining",
+        label: { type: "plain_text", text: "現在の残工数(h)" },
+        element: {
+          type: "plain_text_input",
+          action_id: "remaining",
+          placeholder: { type: "plain_text", text: "例: 2" }
+        }
+      },
+      {
+        type: "input",
+        optional: true,
+        block_id: "daily_blocker",
+        label: { type: "plain_text", text: "ブロッカー（なければ空欄）" },
+        element: {
+          type: "plain_text_input",
+          action_id: "blocker",
+          multiline: true
+        }
+      },
+      {
+        type: "input",
+        optional: true,
+        block_id: "daily_evidence",
+        label: { type: "plain_text", text: "Evidence URL" },
+        element: {
+          type: "url_text_input",
+          action_id: "evidence",
+          placeholder: { type: "plain_text", text: "成果物・PR・資料のURL" }
+        }
+      },
+      {
+        type: "input",
+        optional: true,
+        block_id: "daily_next",
+        label: { type: "plain_text", text: "次にやること" },
+        element: {
+          type: "plain_text_input",
+          action_id: "next",
+          multiline: true
+        }
+      }
+    ]
+  };
+}
+
+async function handleDailyCheckinOpenButton(
+  env: Bindings,
+  payload: SlackInteractionPayload,
+  action: { value?: string }
+): Promise<void> {
+  const sessionId = action.value ?? "";
+  const session = await getDailyCheckinSession(env.NOTIFY_CACHE, sessionId);
+  const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
+  if (!session) {
+    await chatPostMessage(config.slackBotToken, channel, "⚠️ Daily Updateの有効期限が切れています。最新のボタンを使ってください。", undefined, payload.message.thread_ts ?? payload.message.ts);
+    return;
+  }
+  if (session.slackUserId && session.slackUserId !== payload.user.id) {
+    await chatPostMessage(config.slackBotToken, channel, `⚠️ この更新ボタンは <@${session.slackUserId}> 専用です。`, undefined, session.threadTs);
+    return;
+  }
+  await viewsOpen(
+    config.slackBotToken,
+    payload.trigger_id,
+    dailyCheckinModal(session.id, session.tasks)
+  );
+}
+
+async function handleDailyCheckinSubmission(
+  env: Bindings,
+  payload: SlackInteractionPayload,
+  ctx?: ExecutionContext
+): Promise<Response> {
+  const sessionId = payload.view?.private_metadata ?? "";
+  const session = await getDailyCheckinSession(env.NOTIFY_CACHE, sessionId);
+  const errors: Record<string, string> = {};
+  if (!session) {
+    errors.daily_task = "有効期限が切れています。最新のDaily Updateボタンを使ってください。";
+  } else if (session.slackUserId && session.slackUserId !== payload.user.id) {
+    errors.daily_task = "このフォームは別の担当者用です。";
+  } else if (session.date !== toJstDateString()) {
+    errors.daily_task = "日付が変わりました。今日のDaily Updateボタンを使ってください。";
+  }
+
+  const taskId = modalValue(payload, "daily_task", "task");
+  const status = modalValue(payload, "daily_status", "status");
+  const actualText = modalValue(payload, "daily_actual", "actual").trim();
+  const remainingText = modalValue(payload, "daily_remaining", "remaining").trim();
+  const blocker = modalValue(payload, "daily_blocker", "blocker").trim();
+  const evidence = modalValue(payload, "daily_evidence", "evidence").trim();
+  const nextAction = modalValue(payload, "daily_next", "next").trim();
+  const actualHours = Number(actualText);
+  const remainingHours = status === "完了" ? 0 : Number(remainingText);
+  const task = session?.tasks.find((item) => item.id === taskId);
+
+  if (!task) errors.daily_task = errors.daily_task ?? "更新対象のタスクを選択してください。";
+  if (!Number.isFinite(actualHours) || actualHours < 0) {
+    errors.daily_actual = "0以上の数値で入力してください。";
+  }
+  if (!Number.isFinite(remainingHours) || remainingHours < 0) {
+    errors.daily_remaining = "0以上の数値で入力してください。";
+  }
+  if (status === "ペンディング" && !blocker) {
+    errors.daily_blocker = "ペンディング理由と、解除に必要なことを入力してください。";
+  }
+  const requiresEvidence = /doing\((60|80)%\)|レビュー|他者ボール|完了/iu.test(status);
+  if (requiresEvidence && !evidence && !task?.evidenceUrl) {
+    errors.daily_evidence = "60%以上・レビュー・完了ではEvidence URLが必要です。";
+  }
+  if (evidence && !/^https?:\/\//i.test(evidence)) {
+    errors.daily_evidence = "http:// または https:// で始まるURLを入力してください。";
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return new Response(JSON.stringify({ response_action: "errors", errors }), {
+      headers: { "Content-Type": "application/json; charset=utf-8" }
+    });
+  }
+
+  const work = processDailyCheckinSubmission(env, payload.user.id, session!, task!, {
+    status,
+    actualHours,
+    remainingHours,
+    blocker,
+    evidence,
+    nextAction
+  }).catch((error) => console.error("daily checkin submission failed:", error));
+  if (ctx) ctx.waitUntil(work);
+  else await work;
+  return new Response("");
+}
+
+async function processDailyCheckinSubmission(
+  env: Bindings,
+  slackUserId: string,
+  session: DailyCheckinSession,
+  task: DailyCheckinTask,
+  input: {
+    status: string;
+    actualHours: number;
+    remainingHours: number;
+    blocker: string;
+    evidence: string;
+    nextAction: string;
+  }
+): Promise<void> {
+  const config = await resolveConfig(env, session.channel);
+  if (!config.slackBotToken) return;
+  await updateTaskPage(config.notionToken, task.id, {
+    status: input.status,
+    actualHours: input.actualHours,
+    remainingHours: input.remainingHours,
+    progressUpdatedDate: session.date,
+    completedDate: input.status === "完了" ? session.date : undefined,
+    blocker: input.blocker,
+    blockerStartedAt: input.blocker ? task.blockerStartedAt ?? session.date : null,
+    evidenceUrl: input.evidence || undefined
+  });
+  await appendDailyUpdateLog(config.notionToken, task.id, {
+    date: session.date,
+    status: input.status,
+    nextAction: input.nextAction
+  }).catch(() => {});
+  await markDailyCheckinDone(env.NOTIFY_CACHE, session.date, task.id);
+  await chatPostMessage(
+    config.slackBotToken,
+    session.channel,
+    `✅ <@${slackUserId}> が <${task.url}|${task.name}> を更新しました｜${input.status}｜実績 ${input.actualHours}h｜残 ${input.remainingHours}h${input.blocker ? `｜Blocker: ${input.blocker}` : ""}`,
+    undefined,
+    session.threadTs
+  );
+}
+
+// ── Sprint計画Lock ────────────────────────────────────────────────────────
+
+async function handleSprintPlanLockButton(
+  env: Bindings,
+  payload: SlackInteractionPayload,
+  action: { value?: string }
+): Promise<void> {
+  const session = await getSprintPlanLockSession(env.NOTIFY_CACHE, action.value ?? "");
+  const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
+  if (!session) {
+    await chatPostMessage(config.slackBotToken, channel, "⚠️ Planning Draftの有効期限が切れています。もう一度生成してください。", undefined, payload.message.thread_ts ?? payload.message.ts);
+    return;
+  }
+  if (session.channel !== channel) {
+    await chatPostMessage(config.slackBotToken, channel, "⚠️ このPlanning Draftは別チャンネル用です。", undefined, payload.message.thread_ts ?? payload.message.ts);
+    return;
+  }
+  if (config.slackPmUserId && payload.user.id !== config.slackPmUserId) {
+    await chatPostMessage(config.slackBotToken, channel, `⚠️ 計画LockはPM <@${config.slackPmUserId}> のみ実行できます。`, undefined, session.threadTs ?? session.messageTs);
+    return;
+  }
+  const existingBaseline = await getSprintPlanBaseline(
+    env.NOTIFY_CACHE,
+    session.baseline.sprintId
+  );
+  if (existingBaseline?.lockedAt) {
+    await chatPostMessage(
+      config.slackBotToken,
+      channel,
+      `🔒 ${existingBaseline.sprintName} は既に <@${existingBaseline.lockedBy}> が計画Lock済みです。`,
+      undefined,
+      session.threadTs ?? session.messageTs
+    );
+    return;
+  }
+
+  const baseline = {
+    ...session.baseline,
+    lockedAt: new Date().toISOString(),
+    lockedBy: payload.user.id,
+    tasks: session.baseline.tasks.map((task) => ({
+      ...task,
+      sprintClass: task.recommendedClass
+    }))
+  };
+  for (const task of session.baseline.tasks) {
+    if (task.sprintClass !== "Commit" && task.sprintClass !== "Stretch") {
+      await updateTaskSprintClass(config.notionToken, task.id, task.recommendedClass);
+    }
+  }
+  await saveSprintPlanBaseline(env.NOTIFY_CACHE, baseline);
+  const blocksWithoutActions = (payload.message.blocks ?? []).filter(
+    (block: unknown) => (block as Record<string, unknown>).type !== "actions"
+  );
+  const lockedText = `🔒 <@${payload.user.id}> がSprint計画をロックしました｜Baseline ${baseline.totalSp}SP / ${baseline.totalHours}h`;
+  await chatUpdate(
+    config.slackBotToken,
+    channel,
+    payload.message.ts,
+    `${payload.message.text}\n\n${lockedText}`,
+    [...blocksWithoutActions, textSection(lockedText)]
+  );
+  await chatPostMessage(config.slackBotToken, channel, lockedText, undefined, session.threadTs ?? session.messageTs);
 }
 
 // ── Task/Update approval button handler ────────────────────────────────────
@@ -471,23 +862,44 @@ async function handleTaskActionButton(
       ]
     );
 
-    // タスク追加通知（当日スレッドに「✅ {担当者}のタスクが追加されました」）
-    const pmoChannel = config.slackPmoChannelId;
+    // タスク追加通知（当日 MMDD_タスク スレッドに投稿）
+    const pmoChannel = resolveTeamKChannelId(env);
     if (pmoChannel && !config.dryRun) {
-      const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
-      const assignees = [...new Set(taskResults.map((r) => r.newTask.assignee))];
-      const assigneeLabel = assignees.length === 1 ? `${assignees[0]}の` : "";
-      const title = `✅ ${assigneeLabel}タスクが追加されました`;
-      const bullets: string[] = [];
-      for (const r of taskResults) {
-        const t = r.newTask;
-        const dueDisp = t.due ? t.due.slice(5, 10) : "-"; // YYYY-MM-DD → MM-DD
-        const proj = t.project ? t.project : "-";
-        bullets.push(`タスク：「${t.task_name}」（担当：${t.assignee}、Prj：${proj}、期限：${dueDisp}、SP：${t.sp}）`);
+      let taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
+
+      // スレッドが未作成の場合は MMDD_タスク 親メッセージを新規作成して保存
+      if (!taskThread) {
+        const now = new Date();
+        const jstDate = toJstDateString(now);
+        const dateLabel = jstDate.slice(5).replace("-", "/"); // "MM/DD"
+        const parent = await chatPostMessage(config.slackBotToken, pmoChannel, `${dateLabel}_タスク`).catch(() => null);
+        if (parent?.ts) {
+          taskThread = parent.ts;
+          await saveCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel, taskThread).catch(() => {});
+        }
       }
-      // rich_text_list でネイティブ箇条書き描画（text はフォールバック）
-      const fallback = `${title}\n${bullets.map((b) => `• ${b}`).join("\n")}`;
-      await chatPostMessage(config.slackBotToken, pmoChannel, fallback, bulletListBlocks(title, bullets), taskThread ?? undefined);
+
+      const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+      const fmtDue = (due: string | null | undefined): string => {
+        if (!due) return "-";
+        const d = new Date(`${due}T00:00:00+09:00`);
+        const m = d.getMonth() + 1;
+        const day = d.getDate();
+        const w = WEEKDAYS[d.getDay()];
+        return `${m}/${day}(${w})`;
+      };
+      // タイトル行 + rich_text_list で箇条書き（タスクごとにブロックを分ける）
+      const taskBulletSets = taskResults.map((r) => {
+        const t = r.newTask;
+        const proj = t.project ? t.project : "-";
+        return {
+          title: `✅ タスク追加`,
+          bullet: `追加「${t.task_name}」（担当：${t.assignee}、Prj：${proj}、期限：${fmtDue(t.due)}、SP：${t.sp}）`,
+        };
+      });
+      const fallback = taskBulletSets.map((s) => `${s.title}\n${s.bullet}`).join("\n\n");
+      const blocks = taskBulletSets.flatMap((s) => bulletListBlocks(s.title, [s.bullet]));
+      await chatPostMessage(config.slackBotToken, pmoChannel, fallback, blocks, taskThread ?? undefined);
 
       // 起票したタスクの snapshot を Notion 正式値で保存 → 以降の更新を webhook が当日スレッドに通知できる
       if (taskThread) {
@@ -681,7 +1093,7 @@ async function handlePmReportButton(
   );
 
   // 完了通知は当日の MM/DD_タスクスレッドに入れる
-  const pmoChannel = config.slackPmoChannelId;
+  const pmoChannel = resolveTeamKChannelId(env);
   if (pmoChannel) {
     const taskThread = await getCurrentTaskThread(env.NOTIFY_CACHE, pmoChannel).catch(() => null);
     await sendCompletionNotification(config.slackBotToken, pmoChannel, results, config.dryRun, taskThread ?? undefined);

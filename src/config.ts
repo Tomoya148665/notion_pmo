@@ -1,6 +1,10 @@
 export interface Bindings {
   OPENAI_API_KEY: string;
   OPENAI_MODEL?: string;
+  /** KPI実行担保エンジンの会話(詰め・判定・ナッジ)に使うモデル。会話の文脈保持が重要なので既定は上位モデル。 */
+  KPI_OPENAI_MODEL?: string;
+  /** 日次スプリントダッシュボードの背景生成に使う画像モデル。 */
+  OPENAI_IMAGE_MODEL?: string;
   NOTION_OAUTH_ACCESS_TOKEN?: string;
   NOTION_DATABASE_ID?: string;
   NOTION_DATE_PROPERTY?: string;
@@ -10,6 +14,8 @@ export interface Bindings {
   SPRINT_DB_NAME?: string;
   TASK_DB_URL?: string;
   TASK_DB_NAME?: string;
+  EPIC_DB_URL?: string;
+  EPIC_DB_NAME?: string;
   TASK_SPRINT_RELATION_PROPERTY?: string;
   MCP_SERVER_URL?: string;
   MCP_AUTH_TOKEN?: string;
@@ -34,6 +40,10 @@ export interface Bindings {
   TEAM_FILTER?: string;
   DRY_RUN?: string;
   REQUIRE_APPROVAL?: string;
+  // 日次スクショ対象の旧 Notion ページURL（デバッグ fallback） / 送信先チャンネル（名 or ID）。
+  NOTION_S19_URL?: string;
+  S19_SCREENSHOT_CHANNEL?: string;
+  S19_SCREENSHOT_CHANNEL_ID?: string;
   NOTIFY_CACHE: KVNamespace;
   // Browser Rendering binding (Workers 有料プラン)。未バインド環境では undefined。
   BROWSER?: Fetcher;
@@ -46,6 +56,8 @@ export interface Bindings {
 export interface AppConfig {
   openaiApiKey: string;
   openaiModel: string;
+  kpiOpenaiModel: string;
+  openaiImageModel: string;
   notionToken: string;
   notionDatabaseId?: string;
   notionDateProperty: string;
@@ -57,6 +69,9 @@ export interface AppConfig {
   taskDbUrl?: string;
   taskDbName?: string;
   taskDbId?: string;
+  epicDbUrl?: string;
+  epicDbName?: string;
+  epicDbId?: string;
   taskSprintRelationProperty: string;
   notifyProperties: string[];
   slackWebhookUrl?: string;
@@ -83,6 +98,13 @@ export interface AppConfig {
   allowedTools: string[];
   maxRetries: number;
   dedupeTtlSeconds: number;
+}
+
+/** チームK（team-k-古鉄）のタスク通知・日次投稿先。 */
+export const TEAM_K_CHANNEL_ID = "C0A4TVB6H3R";
+
+export function resolveTeamKChannelId(env: Pick<Bindings, "S19_SCREENSHOT_CHANNEL_ID">): string {
+  return env.S19_SCREENSHOT_CHANNEL_ID || TEAM_K_CHANNEL_ID;
 }
 
 const DEFAULT_PROPERTIES = ["確定 見積SP", "確定 実績SP", "確定 想定"];
@@ -153,12 +175,15 @@ export function getConfig(env: Bindings): AppConfig {
 
   const sprintDbId = extractNotionIdFromUrl(env.SPRINT_DB_URL);
   const taskDbId = extractNotionIdFromUrl(env.TASK_DB_URL);
+  const epicDbId = extractNotionIdFromUrl(env.EPIC_DB_URL);
   const memberDbId = extractNotionIdFromUrl(env.MEMBER_DB_URL);
   const referenceDbId = extractNotionIdFromUrl(env.REFERENCE_DB_URL);
 
   return {
     openaiApiKey: env.OPENAI_API_KEY,
     openaiModel: env.OPENAI_MODEL || "gpt-4.1-mini",
+    kpiOpenaiModel: env.KPI_OPENAI_MODEL || "gpt-4.1",
+    openaiImageModel: env.OPENAI_IMAGE_MODEL || "gpt-image-2",
     notionToken: env.NOTION_OAUTH_ACCESS_TOKEN,
     notionDatabaseId: env.NOTION_DATABASE_ID || taskDbId || sprintDbId,
     notionDateProperty: env.NOTION_DATE_PROPERTY || "期間",
@@ -170,6 +195,9 @@ export function getConfig(env: Bindings): AppConfig {
     taskDbUrl: env.TASK_DB_URL,
     taskDbName: env.TASK_DB_NAME,
     taskDbId,
+    epicDbUrl: env.EPIC_DB_URL,
+    epicDbName: env.EPIC_DB_NAME,
+    epicDbId,
     taskSprintRelationProperty:
       env.TASK_SPRINT_RELATION_PROPERTY || "スプリント",
     notifyProperties: parseList(env.NOTIFY_PROPERTIES),

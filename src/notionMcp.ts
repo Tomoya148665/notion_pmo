@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config";
+import { withOptionalTemperature } from "./openaiCompat";
 import { openAiJsonSchema, sprintTasksJsonSchema } from "./schema";
 
 type ResponseContentPart = { type?: string; text?: string; json?: unknown };
@@ -142,7 +143,7 @@ export async function fetchFreeText(
     today: now.toISOString().slice(0, 10)
   };
 
-  const body = {
+  const body = withOptionalTemperature({
     model: config.openaiModel,
     input: [
       { role: "system", content: system },
@@ -154,9 +155,8 @@ export async function fetchFreeText(
       }
     ],
     tools: [toolDef],
-    temperature: 0.1,
     max_output_tokens: 800
-  };
+  }, config.openaiModel, 0.1);
 
   const res = await callOpenAi(config, body);
   const parsed = (await res.json()) as OpenAIResponse;
@@ -187,7 +187,7 @@ export async function fetchSprintSummary(
     today: now.toISOString().slice(0, 10)
   };
 
-  const body = {
+  const body = withOptionalTemperature({
     model: config.openaiModel,
     input: [
       {
@@ -212,9 +212,8 @@ export async function fetchSprintSummary(
     text: {
       format: normalizeTextFormat(openAiJsonSchema)
     },
-    temperature: 0.1,
     max_output_tokens: 800
-  };
+  }, config.openaiModel, 0.1);
 
   const res = await callOpenAi(config, body);
   const parsed = (await res.json()) as OpenAIResponse;
@@ -253,7 +252,7 @@ export async function fetchSprintTasks(
     today: now.toISOString().slice(0, 10)
   };
 
-  const body = {
+  const body = withOptionalTemperature({
     model: config.openaiModel,
     input: [
       {
@@ -282,9 +281,8 @@ Input: ${JSON.stringify(
     text: {
       format: normalizeTextFormat(sprintTasksJsonSchema)
     },
-    temperature: 0.1,
     max_output_tokens: 1200
-  };
+  }, config.openaiModel, 0.1);
 
   const res = await callOpenAi(config, body);
   const parsed = (await res.json()) as OpenAIResponse;

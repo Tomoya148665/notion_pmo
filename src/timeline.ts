@@ -234,7 +234,12 @@ export function renderTimelineHtml(
 /** Browser Rendering で HTML(#root内にRecharts) をスクショして PNG を返す共通処理。失敗時 null。 */
 export async function htmlToPng(
   browser: Fetcher | undefined,
-  html: string
+  html: string,
+  viewport: { width: number; height: number; deviceScaleFactor?: number } = {
+    width: 1400,
+    height: 900,
+    deviceScaleFactor: 2
+  }
 ): Promise<Uint8Array | null> {
   if (!browser) return null;
   const puppeteer = (await import("@cloudflare/puppeteer")).default;
@@ -242,7 +247,11 @@ export async function htmlToPng(
   try {
     br = await puppeteer.launch(browser);
     const page = await br.newPage();
-    await page.setViewport({ width: 1400, height: 900, deviceScaleFactor: 2 });
+    await page.setViewport({
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor ?? 1
+    });
     await page.setContent(html, { waitUntil: "networkidle0" });
     await page.waitForSelector("#root svg.recharts-surface", { timeout: 8000 }).catch(() => {});
     const el = await page.$("#root");

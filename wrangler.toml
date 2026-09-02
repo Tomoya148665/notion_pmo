@@ -8,15 +8,16 @@ compatibility_flags = ["nodejs_compat"]
 # 別アカウントで `wrangler login` していると deploy がエラーになり、誤デプロイを防げる。
 account_id = "43ac0fa6a0cf47be7839e6178a2588d0"
 
-# Cron Triggers (UTC)。Cloudflare Free プランは「展開後」5 個までが上限。
-# 例: "10,20,30,40,50 0 * * *" は 5 トリガーとして数えられる点に注意。
-# 現在は 08:00 JST と 08:30 JST(タスクリマインド) の 2 個。定期通知(担当者通知/PMレポート/
-# リマインド)をフル稼働させる場合は cron を展開後 5 個以内に収めて追加すること。
-# "30 23 * * *" = 08:30 JST タスクリマインド(runTaskReminderFlow / full)
-# "0 5 * * *"   = 14:00 JST タスク状況の追記リマインド(runTaskReminderFlow / midday)
-# "0 11 * * *"  = 20:00 JST タスク状況の追記リマインド(runTaskReminderFlow / evening)
-# "0 15 * * *"  = 24:00 JST(翌0時) 本日の進捗サマリー(runDailyProgressSummary)
-triggers = { crons = ["0 23 * * *", "30 23 * * *", "0 5 * * *", "0 11 * * *", "0 15 * * *"] }
+# Cron Triggers (UTC)。単一の */10(10分おき)に集約し、scheduled() 内で JST 時刻ゲートして
+# 日次ジョブを発火させる（Cloudflare の cron 上限対策）。
+# 発火マッピング(JST): 08:30=タスクリマインド(full) / 08:40=KPI実行担保エンジン 朝スレッド /
+#   14:00=タスクmidday / 18:00=KPIエスカレーション(1) / 20:00=タスクevening /
+#   08:50=Delivery Control Digest（画像）+ 土曜のみSprint Planning診断 /
+#   12:00=Delivery Alert再評価 / 金曜17:50=Portfolio・FTE週次 / 18:30=Delivery未更新Reminder /
+#   21:00=KPIエスカレーション(2) /
+#   24:00(0:00)=進捗サマリー→SPRINT CONTROL（最後） /
+#   25:00(=翌01:00, hm=100)=KPI週次表投稿（スレッド返信+チャンネル投稿）
+triggers = { crons = ["*/10 * * * *"] }
 
 [observability]
 enabled = true
@@ -32,9 +33,23 @@ id = "6e1d5ae41cec40189b2f653e8dcee0b3"
 preview_id = "6e1d5ae41cec40189b2f653e8dcee0b3"
 
 [vars]
-OPENAI_MODEL = "gpt-4.1-mini"
+OPENAI_MODEL = "gpt-5.6-luna"
+# KPI実行担保エンジンの会話(詰め・判定・ナッジ)用。会話の文脈保持・ペース計算の正確さが必要なため上位モデル。
+KPI_OPENAI_MODEL = "gpt-5.6-terra"
+# 日次 SPRINT CONTROL の装飾背景。数値・グラフは Worker 側で正確に描画する。
+OPENAI_IMAGE_MODEL = "gpt-image-2"
 NOTIFY_PROPERTIES = "[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"
 TEAM_FILTER = "TeamK"
+# Sprint の成果到達点を管理する Epic / Workstream DB（非機密）。
+EPIC_DB_URL = "https://app.notion.com/p/247bcaffc54f426aba59e4132d3f02e9"
 DRY_RUN = "false"
 MEMBER_EXCLUDE = "中村"
 MEMBER_EXTRA = "{\"松田直樹\":\"Matsuda Naoki\"}"
+NOTION_BOARD_VIEW_URL = "https://app.notion.com/p/aice-co-jp/241e00135b6180ce987fe97df3036458?v=2d7e00135b6180eca61a000cc8954548"
+NOTION_TIMELINE_VIEW_URL = "https://app.notion.com/p/aice-co-jp/241e00135b6180ce987fe97df3036458?v=519ab1cc6ed942d5a8abc747542e137e"
+# デイリー KPI 投稿先は固定の KPI ページ（KPI_PAGE_URL, src/index.ts）を既定で使う。
+# ページ内に週ごとの「デイリー KPI」表が複数あっても、対象日の日付列を含む表を自動選択する。
+# 別ページを一時的に使いたい場合のみ NOTION_S19_URL を設定する（未設定なら KPI_PAGE_URL を使用）。
+# KPI実行担保エンジン(08:30/08:40/14:00/18:00/20:00/21:00/24:00/25:00)は全て team-k-古鉄 に投稿する。
+# S19_SCREENSHOT_CHANNEL_ID を設定するとその都度の Slack API 名前解決を省略できる（チャンネルIDは非機密）。
+S19_SCREENSHOT_CHANNEL_ID = "C0A4TVB6H3R"

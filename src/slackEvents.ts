@@ -21,21 +21,30 @@ import {
   toJstDateString,
   savePhoneReminder,
   deletePhoneReminder,
-  getThreadCreatedTasks
+  getThreadCreatedTasks,
+  getKpiThreadState,
+  saveKpiThreadState
 } from "./workflow";
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen, conversationsInfo, usersInfo } from "./slackBot";
 import { ensureProjectCatalog, resolveProjectFromCache, resolveProjectByChannelName, topProjectCandidates, extractProjectFromText, saveProjectAlias, resolveProjectByAlias, type CachedProject } from "./projectCatalog";
 import { ensureUserCatalog, makeAssigneeResolver, resolveMemberBySlackId, extractAssigneesFromText, type AssigneeResolver, type CachedUser } from "./userCatalog";
-import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
+import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription, evaluateKpiReply } from "./llmAnalyzer";
+import { getKpiMemory, appendKpiCommitment, appendKpiExcuse, rememberKpiContextNote, recentForItem } from "./kpiMemory";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
-import { fetchCurrentSprintTasksSummary, fetchCurrentSprintInfo, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchTaskStatusOptions } from "./notionApi";
+import { fetchCurrentSprintTasksSummary, fetchCurrentSprintInfo, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchTaskStatusOptions, isVirtualSprintId } from "./notionApi";
 import { fetchMembers } from "./memberApi";
 import {
   calculateAvgDailySpConsumption,
   calcAvgDailySpFromSprint,
   detectStagnantDoingTasks,
-  calculateWeeklyDiff
+  calculateWeeklyDiff,
+  resolveDailyKpiTarget,
+  jstTodayMD,
+  buildKpiRowContexts
 } from "./index";
+import { fetchScrumTable, progressUnits } from "./s19Scrum";
+import { appendConversationTurn } from "./workflow";
+import type { KpiCurrentStateForLlm } from "./llmAnalyzer";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import type { AllocationProposal, NewTask, MentionContext } from "./schema";
 import { buildApprovalButtons, buildTimeSelectionButtons } from "./slackInteractions";
@@ -228,7 +237,7 @@ export async function executeTaskCreation(
     properties["担当者"] = { people: assigneeIds.map((id) => ({ id })) };
   }
 
-  if (task.sprintId) {
+  if (task.sprintId && !isVirtualSprintId(task.sprintId)) {
     properties[config.taskSprintRelationProperty] = {
       relation: [{ id: task.sprintId }]
     };
@@ -1804,6 +1813,181 @@ async function handleAssigneeReply(
   }
 }
 
+// ── Handle KPI thread replies (message event in tracked KPI incident) ─────
+// 「詰め」の会話フロー: リスク検知済みのKPIについての返信が納得のいく内容かLLMで判定し、
+// 未解決なら同じスレッドで（毎回新しい文面で）押し返す。満足/不満足に関わらず、抽出した
+// 約束・言い訳は本人ごとの長期記憶(kpiMemory)に書き込む（「前回も同じ理由」判定のため）。
+
+/**
+ * KPI詰めスレッドへの1返信を処理するコア処理（Slackイベント/デバッグ用エンドポイントの両方から呼べるよう分離）。
+ * 対象インシデントが無ければ何もしない（no-op を示す ok:false, skipped:true 相当を返す）。
+ */
+export async function processKpiReply(
+  env: Bindings,
+  params: { channel: string; threadTs: string; userId: string; text: string }
+): Promise<Record<string, unknown>> {
+  const { channel, threadTs, userId } = params;
+  const text = params.text.trim();
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return { ok: false, skipped: "no bot token" };
+  if (!text) return { ok: false, skipped: "empty text" };
+
+  const kpiState = await getKpiThreadState(env.NOTIFY_CACHE, channel, threadTs);
+  if (!kpiState) return { ok: false, skipped: "no kpi thread state" };
+  const incident = kpiState.incidents[userId];
+  if (!incident || incident.resolved || incident.items.length === 0) {
+    return { ok: false, skipped: "no active incident for user" };
+  }
+
+  let memory = await getKpiMemory(env.NOTIFY_CACHE, incident.member);
+
+  // 「1て書いてる」のように本人が表記ルールを訂正した場合は、当日スレッドだけで
+  // 終わらせずKPI項目ごとの長期記憶に残す。次週・別スレッドのナッジにも渡される。
+  const recordedCount = text.match(/(?:^|\D)(\d+)(?:\s*回)?\s*(?:って|て|と)?\s*(?:書いて|記入|入力)/)?.[1];
+  if (recordedCount) {
+    await Promise.all(
+      incident.items.map((item) =>
+        rememberKpiContextNote(env.NOTIFY_CACHE, incident.member, {
+          itemKey: item.itemKey,
+          kpiText: item.kpiText,
+          note: `Notion KPI表の単独数値「${recordedCount}」は、週内の実施回数の累計を表す実績記録。`,
+          recordedAt: new Date().toISOString()
+        }).catch(() => {})
+      )
+    );
+    // 今回の返答生成にも、更新直後の記憶を使う。
+    memory = await getKpiMemory(env.NOTIFY_CACHE, incident.member);
+  }
+  const historyForLlm = incident.items.map((i) => ({ kpiText: i.kpiText, ...recentForItem(memory, i.itemKey) }));
+
+  // Notion表の最新値を取得（検知時のdetailは古い可能性があるため、判定は現在値ベースで行う）。
+  // 表が取れなくても判定自体は続行する（会話履歴と本人報告だけで判断）。
+  const currentState: KpiCurrentStateForLlm[] = [];
+  try {
+    const target = resolveDailyKpiTarget(env);
+    const todayMD = jstTodayMD();
+    const table = await fetchScrumTable(config, target.url, { month: todayMD.m, day: todayMD.d });
+    if (table) {
+      const rowCtxs = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+      const todayPos = table.dateColumns.findIndex((c) => c.month === todayMD.m && c.day === todayMD.d);
+      for (const item of incident.items) {
+        const row = rowCtxs.find((r) => r.itemKey === item.itemKey);
+        if (!row || todayPos < 0) continue;
+        const colsUptoToday = table.dateColumns.slice(0, todayPos + 1);
+        const cells = colsUptoToday.map((c) => ({
+          label: c.label,
+          value: (row.cells[c.index] ?? "").trim() || "(未記入)"
+        }));
+        let weekly: KpiCurrentStateForLlm["weekly"];
+        if (row.cadence.kind === "weekly_count" && row.cadence.countPerWeek) {
+          const doneSoFar = colsUptoToday.reduce(
+            (total, c) => total + progressUnits(row.cells[c.index] ?? ""),
+            0
+          );
+          weekly = {
+            countPerWeek: row.cadence.countPerWeek,
+            doneSoFar,
+            daysRemainingIncludingToday: table.dateColumns.length - todayPos
+          };
+        }
+        currentState.push({ itemKey: item.itemKey, kpiText: item.kpiText, cells, weekly });
+      }
+    }
+  } catch (err) {
+    console.warn(`processKpiReply: current state fetch failed: ${(err as Error).message}`);
+  }
+
+  let judgment;
+  try {
+    judgment = await evaluateKpiReply(config, {
+      member: incident.member,
+      replyText: text,
+      items: incident.items,
+      history: historyForLlm,
+      pressCount: incident.pressCount,
+      conversation: incident.conversation,
+      currentState
+    });
+  } catch (err) {
+    console.error("evaluateKpiReply failed", (err as Error).message);
+    return { ok: false, error: (err as Error).message }; // fail-closed: 誤って解決扱いにしない
+  }
+
+  const now = new Date().toISOString();
+  const madeAt = now;
+  const itemsByKey = new Map(incident.items.map((i) => [i.itemKey, i]));
+
+  // 抽出された約束/言い訳は、LLMが指定した item_keys にのみ記録する
+  // （他のitemに誤って流用すると、無関係なitemの夜間エスカレーションまで抑制してしまうため）。
+  if (judgment.extracted_commitment) {
+    const commitment = judgment.extracted_commitment;
+    for (const itemKey of commitment.item_keys) {
+      const item = itemsByKey.get(itemKey);
+      if (!item) continue;
+      await appendKpiCommitment(env.NOTIFY_CACHE, incident.member, {
+        itemKey: item.itemKey,
+        kpiText: item.kpiText,
+        committedDate: commitment.date,
+        what: commitment.what,
+        madeAt,
+        fulfilled: "pending"
+      }).catch(() => {});
+    }
+  }
+  if (judgment.extracted_excuse) {
+    const excuseText = judgment.extracted_excuse.text;
+    for (const itemKey of judgment.extracted_excuse.item_keys) {
+      const item = itemsByKey.get(itemKey);
+      if (!item) continue;
+      await appendKpiExcuse(env.NOTIFY_CACHE, incident.member, {
+        itemKey: item.itemKey,
+        kpiText: item.kpiText,
+        excuseText,
+        givenAt: now
+      }).catch(() => {});
+    }
+  }
+
+  const remainingItems = incident.items.filter((i) => !judgment.satisfied_item_keys.includes(i.itemKey));
+  const updatedIncident = {
+    ...incident,
+    items: remainingItems,
+    pressCount: incident.pressCount + 1,
+    lastPromptAt: now,
+    resolved: remainingItems.length === 0,
+    conversation: appendConversationTurn(
+      appendConversationTurn(incident.conversation, "member", text),
+      "bot",
+      judgment.response_text
+    )
+  };
+
+  await saveKpiThreadState(env.NOTIFY_CACHE, channel, threadTs, {
+    ...kpiState,
+    incidents: { ...kpiState.incidents, [userId]: updatedIncident }
+  }).catch(() => {});
+
+  await chatPostMessage(config.slackBotToken, channel, judgment.response_text, undefined, threadTs).catch(() => {});
+  console.log(
+    `processKpiReply: member=${incident.member} pressCount=${updatedIncident.pressCount} resolved=${updatedIncident.resolved} remaining=${remainingItems.length}`
+  );
+  return { ok: true, judgment, resolved: updatedIncident.resolved, remaining: remainingItems.length };
+}
+
+// ── Handle KPI thread replies (message event in tracked KPI incident) ─────
+// 「詰め」の会話フロー: リスク検知済みのKPIについての返信が納得のいく内容かLLMで判定し、
+// 未解決なら同じスレッドで（毎回新しい文面で）押し返す。満足/不満足に関わらず、抽出した
+// 約束・言い訳は本人ごとの長期記憶(kpiMemory)に書き込む（「前回も同じ理由」判定のため）。
+
+async function handleKpiReply(env: Bindings, event: Record<string, unknown>): Promise<void> {
+  if (event.bot_id || event.bot_profile || !event.user) return;
+  const channel = event.channel as string;
+  const threadTs = event.thread_ts as string;
+  const text = (event.text as string) ?? "";
+  const userId = (event.user as string) ?? "";
+  await processKpiReply(env, { channel, threadTs, userId, text });
+}
+
 // ── Handle PM DM thread reply (message event → Step 8) ────────────────────
 
 async function handlePmReply(
@@ -2033,6 +2217,7 @@ export async function handleSlackEvents(
             } else {
               await handleAssigneeReply(env, event);
               await handlePmReply(env, event);
+              await handleKpiReply(env, event);
             }
           }
         });

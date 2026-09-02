@@ -2,8 +2,91 @@ import { extractNotionIdFromUrl, type AppConfig } from "./config";
 import type { SprintTasksSummary } from "./schema";
 import { withRetry } from "./retry";
 import { toJstDateString } from "./workflow";
+import type {
+  DeliveryProjectRecord,
+  DeliverySnapshot,
+  DeliveryTaskRecord
+} from "./deliveryControl";
 
 const NOTION_VERSION = "2022-06-28";
+
+// ── Virtual Sprint (Sprint DB 不使用時の週次スプリント自動計算) ─────────────
+export const VIRTUAL_SPRINT_PREFIX = "virtual-";
+
+export function isVirtualSprintId(id: string): boolean {
+  return id.startsWith(VIRTUAL_SPRINT_PREFIX);
+}
+
+/**
+ * JST の土〜金を1スプリントとして、指定日を含む週のスプリント情報を返す。
+ * 例: 2026-07-25(土) 〜 2026-07-31(金) → id=virtual-2026-07-25
+ */
+export function computeVirtualSprint(
+  now: Date
+): { id: string; name: string; start_date: string; end_date: string; status: string } {
+  const jstMs = now.getTime() + 9 * 3600 * 1000;
+  const jst = new Date(jstMs);
+  const dow = jst.getUTCDay(); // 0=Sun … 6=Sat
+  const daysFromSat = dow === 6 ? 0 : (dow + 1);
+  const startMs = jstMs - daysFromSat * 86400000;
+  const start = new Date(startMs).toISOString().slice(0, 10);
+  const end = new Date(startMs + 6 * 86400000).toISOString().slice(0, 10);
+  const mmdd = (s: string) => s.slice(5).replace("-", "/");
+  return {
+    id: `${VIRTUAL_SPRINT_PREFIX}${start}`,
+    name: `${mmdd(start)}〜${mmdd(end)}`,
+    start_date: start,
+    end_date: end,
+    status: "進行中"
+  };
+}
+
+/** 直近 count 週分の仮想スプリントを返す（新→旧順）。 */
+function computeVirtualSprintHistory(
+  count: number,
+  now: Date
+): Array<{ id: string; name: string; start_date: string; end_date: string; status: string }> {
+  const results = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(now.getTime() - i * 7 * 86400000);
+    results.push(computeVirtualSprint(d));
+  }
+  return results;
+}
+
+/**
+ * 仮想スプリント ID から開始日・終了日を返す。
+ * 通常スプリントなら null。
+ */
+function virtualSprintDates(
+  sprintId: string
+): { start_date: string; end_date: string } | null {
+  if (!isVirtualSprintId(sprintId)) return null;
+  const start = sprintId.slice(VIRTUAL_SPRINT_PREFIX.length);
+  const end = new Date(
+    new Date(start + "T00:00:00Z").getTime() + 6 * 86400000
+  ).toISOString().slice(0, 10);
+  return { start_date: start, end_date: end };
+}
+
+/**
+ * スプリントタスクの Notion フィルタを返す。
+ * 仮想スプリントなら「期限」の日付範囲フィルタ、通常なら relation フィルタ。
+ */
+function buildSprintTaskFilter(
+  config: AppConfig,
+  sprint: { id: string; start_date: string; end_date: string }
+): Record<string, unknown> {
+  if (isVirtualSprintId(sprint.id)) {
+    return {
+      and: [
+        { property: "期限", date: { on_or_after: sprint.start_date } },
+        { property: "期限", date: { on_or_before: sprint.end_date } }
+      ]
+    };
+  }
+  return { property: config.taskSprintRelationProperty, relation: { contains: sprint.id } };
+}
 
 interface NotionTask {
   id: string;
@@ -184,6 +267,15 @@ export const isCompletedStatus = (status?: string | null): boolean => {
   );
 };
 
+/** 0〜1 のSP進捗率。完了=1.0, doing(60%)=0.6, それ以外=0 */
+export function statusProgressRate(status: string | null | undefined): number {
+  if (!status) return 0;
+  if (isCompletedStatus(status)) return 1.0;
+  const m = status.match(/(\d+)\s*%/);
+  if (m) return Math.min(100, parseInt(m[1], 10)) / 100;
+  return 0;
+}
+
 const isActiveStatus = (status?: string | null): boolean => {
   if (!status) return false;
   return ACTIVE_STATUSES.some((s) =>
@@ -200,6 +292,27 @@ const isDateInRange = (
   if (!startDate) return false;
   const endDate = normalizeDateString(end) || startDate;
   return startDate <= target && target <= endDate;
+};
+
+const newestSprint = (sprints: SprintInfo[]): SprintInfo | undefined =>
+  [...sprints].sort((a, b) =>
+    b.start_date.localeCompare(a.start_date) ||
+    b.end_date.localeCompare(a.end_date)
+  )[0];
+
+const selectCurrentSprint = (
+  sprints: SprintInfo[],
+  today: string
+): SprintInfo | undefined => {
+  const inRange = sprints.filter((s) =>
+    isDateInRange(today, s.start_date, s.end_date)
+  );
+  if (inRange.length > 0) return newestSprint(inRange);
+
+  const active = sprints.filter((s) => isActiveStatus(s.status));
+  if (active.length > 0) return newestSprint(active);
+
+  return newestSprint(sprints);
 };
 
 
@@ -594,66 +707,73 @@ const groupTasksByAssignee = (
 
 export async function fetchCurrentSprintTasksSummary(
   config: AppConfig,
-  now: Date
+  now: Date,
+  opts: { includeCompleted?: boolean } = {}
 ): Promise<SprintTasksSummary> {
-  const sprintDbId = await resolveDatabaseId(config, {
-    url: config.sprintDbUrl,
-    name: config.sprintDbName,
-    label: "SPRINT_DB"
-  });
+  // Sprint DB 未設定時は仮想スプリント（土〜金の週次）にフォールバック
+  const hasSprintDb = !!(config.sprintDbUrl || config.sprintDbName);
   const taskDbId = await resolveDatabaseId(config, {
     url: config.taskDbUrl,
     name: config.taskDbName,
     label: "TASK_DB"
   });
 
-  const dateProp = config.notionDateProperty;
-  const sprintPages = await queryDatabase(
-    config,
-    sprintDbId,
-    {},
-    10
-  );
-  if (sprintPages.length === 0) {
-    throw new Error("Sprint DB query returned no results");
+  let sprint: SprintInfo;
+
+  if (!hasSprintDb) {
+    const v = computeVirtualSprint(now);
+    sprint = { ...v, planSp: null, progressSp: null, requiredSpPerDay: null };
+    console.log("Virtual sprint (no Sprint DB):", sprint.name, sprint.start_date, "~", sprint.end_date);
+  } else {
+    const sprintDbId = await resolveDatabaseId(config, {
+      url: config.sprintDbUrl,
+      name: config.sprintDbName,
+      label: "SPRINT_DB"
+    });
+
+    const dateProp = config.notionDateProperty;
+    const sprintPages = await queryDatabase(config, sprintDbId, {}, 10);
+    if (sprintPages.length === 0) {
+      throw new Error("Sprint DB query returned no results");
+    }
+
+    const today = toJstDateString(now);
+    const sprintCandidates = sprintPages
+      .map((page) => extractSprintInfo(page, dateProp))
+      .filter((s): s is SprintInfo => s != null);
+    if (sprintCandidates.length === 0) {
+      throw new Error("Sprint records did not contain a valid period property");
+    }
+
+    console.log("Sprint candidates:", sprintCandidates.map((s) => `${s.name} ${s.start_date}~${s.end_date} [${s.status}]`));
+    console.log("Looking for sprint containing today:", today);
+
+    const selected = selectCurrentSprint(sprintCandidates, today);
+    if (!selected) throw new Error("Could not select current sprint");
+
+    console.log("Selected sprint:", selected.name, selected.start_date, "~", selected.end_date);
+    sprint = selected;
   }
-
-  const today = toJstDateString(now);
-  const sprintCandidates = sprintPages
-    .map((page) => extractSprintInfo(page, dateProp))
-    .filter((sprint): sprint is SprintInfo => sprint != null);
-  if (sprintCandidates.length === 0) {
-    throw new Error("Sprint records did not contain a valid period property");
-  }
-
-  console.log("Sprint candidates:", sprintCandidates.map((s) => `${s.name} ${s.start_date}~${s.end_date} [${s.status}]`));
-  console.log("Looking for sprint containing today:", today);
-
-  let sprint =
-    sprintCandidates.find((s) =>
-      isDateInRange(today, s.start_date, s.end_date)
-    ) ?? sprintCandidates.find((s) => isActiveStatus(s.status));
-  if (!sprint) sprint = sprintCandidates[0];
-
-  console.log("Selected sprint:", sprint.name, sprint.start_date, "~", sprint.end_date);
 
   const taskPages = await queryDatabase(
     config,
     taskDbId,
-    {
-      filter: {
-        property: config.taskSprintRelationProperty,
-        relation: { contains: sprint.id }
-      }
-    },
+    { filter: buildSprintTaskFilter(config, sprint) },
     10
   );
 
   const tasks: TaskRow[] = [];
+  const metricTasks: TaskRow[] = [];
   // Extract project relation — collect from ALL non-completed tasks and pick the most common
   const projectIdCounts = new Map<string, number>();
   for (const page of taskPages) {
-    const task = extractTaskRow(page);
+    // 返却一覧は従来どおり未完了中心だが、Sprint 指標は完了済みも含む全タスクで算出する。
+    const metricTask = extractTaskRow(page, { includeCompleted: true });
+    if (!metricTask) continue;
+    metricTasks.push(metricTask);
+    const task = opts.includeCompleted || !isCompletedStatus(metricTask.status)
+      ? metricTask
+      : null;
     if (!task) continue;
     tasks.push(task);
     const props = page?.properties ?? {};
@@ -707,6 +827,32 @@ export async function fetchCurrentSprintTasksSummary(
     }
   }
 
+  const measurableTasks = metricTasks.filter(
+    (task) => !/中止|cancel|abort/i.test(task.status ?? "")
+  );
+  const calculatedPlanSp = measurableTasks.reduce(
+    (sum, task) => sum + (task.sp ?? 0),
+    0
+  );
+  const calculatedProgressSp = measurableTasks.reduce(
+    (sum, task) => sum + (task.sp ?? 0) * statusProgressRate(task.status),
+    0
+  );
+  const planSp = sprint.planSp ?? Math.round(calculatedPlanSp * 10) / 10;
+  const progressSp = sprint.progressSp ?? Math.round(calculatedProgressSp * 10) / 10;
+  const today = toJstDateString(now);
+  const remainingDays = Math.max(
+    1,
+    Math.ceil(
+      (new Date(`${sprint.end_date}T00:00:00Z`).getTime() -
+        new Date(`${today}T00:00:00Z`).getTime()) /
+        86400000
+    )
+  );
+  const requiredSpPerDay =
+    sprint.requiredSpPerDay ??
+    Math.round((Math.max(0, planSp - progressSp) / remainingDays) * 100) / 100;
+
   return {
     sprint: {
       id: sprint.id,
@@ -716,9 +862,9 @@ export async function fetchCurrentSprintTasksSummary(
       status: sprint.status
     },
     sprint_metrics: {
-      plan_sp: sprint.planSp,
-      progress_sp: sprint.progressSp,
-      required_sp_per_day: sprint.requiredSpPerDay
+      plan_sp: planSp,
+      progress_sp: progressSp,
+      required_sp_per_day: requiredSpPerDay
     },
     assignees,
     projectIds
@@ -808,10 +954,14 @@ export async function fetchSprintBurndownTasks(
     name: config.taskDbName,
     label: "TASK_DB"
   });
+  const vDates = virtualSprintDates(sprintId);
+  const sprintFilter = vDates
+    ? buildSprintTaskFilter(config, { id: sprintId, ...vDates })
+    : { property: config.taskSprintRelationProperty, relation: { contains: sprintId } };
   const pages = await queryDatabase(
     config,
     taskDbId,
-    { filter: { property: config.taskSprintRelationProperty, relation: { contains: sprintId } } },
+    { filter: sprintFilter },
     10
   );
   return pages.map((page: any) => {
@@ -832,7 +982,495 @@ export async function fetchSprintBurndownTasks(
   });
 }
 
-interface MemberCapacity {
+export interface SprintDashboardTask {
+  id: string;
+  url?: string;
+  name: string;
+  sp: number;
+  status: string | null;
+  assignees: string[];
+  projectNames: string[];
+  priority?: string | null;
+  sprintClass?: string | null;
+  budgetHours?: number | null;
+  actualHours?: number | null;
+  remainingHours?: number | null;
+  /** Notion に明示的な完了日がある場合のみ。 */
+  completedDate: string | null;
+  /** 完了日がない既存タスクの初回履歴推定に使う JST 日付。 */
+  lastEditedDate: string | null;
+  /** Planning 品質チェックに使う完了条件。 */
+  completionCriteria?: string;
+  /** 仮想 Sprint で使うタスク期限。 */
+  dueDate?: string | null;
+}
+
+export interface SprintCheckpointRecord {
+  id: string;
+  name: string;
+  kind: string | null;
+  status: string | null;
+  goal: string;
+  checkpoint: string;
+  checkpointDue: string | null;
+  taskIds: string[];
+  projectNames: string[];
+  health: string | null;
+}
+
+/**
+ * スプリントのゲーミフィケーション画像用データ。
+ * 現時点の完了SPはステータスから正確に集計し、過去推移の初回推定だけ
+ * last_edited_time を利用する。以後の推移は KV の日次スナップショットを使う。
+ */
+export async function fetchSprintDashboardTasks(
+  config: AppConfig,
+  sprintId: string,
+  opts: { resolveProjects?: boolean } = {}
+): Promise<SprintDashboardTask[]> {
+  const taskDbId = await resolveDatabaseId(config, {
+    url: config.taskDbUrl,
+    name: config.taskDbName,
+    label: "TASK_DB"
+  });
+  const vDates = virtualSprintDates(sprintId);
+  const sprintFilter = vDates
+    ? buildSprintTaskFilter(config, { id: sprintId, ...vDates })
+    : { property: config.taskSprintRelationProperty, relation: { contains: sprintId } };
+  const pages = await queryDatabase(
+    config,
+    taskDbId,
+    { filter: sprintFilter },
+    10
+  );
+
+  const extracted = pages.map((page: any) => {
+    const props = page?.properties ?? {};
+    const statusProp =
+      getPropertyByName(props, ["ステータス", "Status", "状態"]) ||
+      findPropertiesByType(props, "status")[0]?.value;
+    const assigneeProp =
+      getPropertyByName(props, ["担当者", "Assignee", "Owner"]) ||
+      (findPropertiesByType(props, "people").length === 1
+        ? findPropertiesByType(props, "people")[0].value
+        : undefined);
+    const completedProp = getPropertyByName(props, [
+      "完了日",
+      "Completed Date",
+      "Completion Date"
+    ]);
+    const dueProp = getPropertyByName(props, ["期限", "Due", "Due Date"]);
+    const completionCriteriaProp = getPropertyByName(props, [
+      "完了条件",
+      "Acceptance Criteria",
+      "Done Definition"
+    ]);
+    const priorityProp = getPropertyByName(props, ["優先度", "Priority"]);
+    const sprintClassProp = getPropertyByName(props, ["Sprint区分", "Sprint Class"]);
+    const lastEditedDate =
+      typeof page?.last_edited_time === "string"
+        ? new Date(new Date(page.last_edited_time).getTime() + 9 * 3600 * 1000)
+            .toISOString()
+            .slice(0, 10)
+        : null;
+    const projectProp = getPropertyByName(props, ["プロジェクト", "Project"]);
+    const projectIds: string[] =
+      projectProp?.type === "relation" && Array.isArray(projectProp.relation)
+        ? projectProp.relation
+            .map((relation: any) => relation?.id)
+            .filter((id: unknown): id is string => typeof id === "string")
+        : [];
+
+    return {
+      id: String(page?.id ?? ""),
+      url: String(page?.url ?? ""),
+      name: getTitleFromProperties(props, ["名前", "Name"]),
+      sp:
+        asNumber(props?.SP) ??
+        asNumber(props?.ポイント) ??
+        asNumber(props?.["Story Points"]) ??
+        0,
+      status: getStatusName(statusProp) ?? null,
+      assignees: getPeopleNames(assigneeProp),
+      priority: getStatusName(priorityProp) ?? null,
+      sprintClass: getStatusName(sprintClassProp) ?? null,
+      budgetHours: asNumber(props?.["工数予算(h)"]),
+      actualHours: asNumber(props?.["実績工数(h)"]),
+      remainingHours: asNumber(props?.["残工数(h)"]),
+      projectIds,
+      completedDate:
+        normalizeDateString(getDateValue(completedProp)?.start) ?? null,
+      lastEditedDate,
+      completionCriteria: titleFromRichText(completionCriteriaProp?.rich_text),
+      dueDate:
+        normalizeDateString(
+          getDateValue(dueProp)?.end ?? getDateValue(dueProp)?.start
+        ) ?? null
+    };
+  });
+
+  const projectIds: string[] = [
+    ...new Set(extracted.flatMap((task) => task.projectIds))
+  ];
+  const projectTitles =
+    opts.resolveProjects !== false && projectIds.length > 0
+      ? await fetchPageTitles(config, projectIds)
+      : new Map<string, string>();
+  return extracted.map(({ projectIds: ids, ...task }) => ({
+    ...task,
+    projectNames: ids
+      .map((id) => projectTitles.get(id))
+      .filter((name): name is string => typeof name === "string" && name.length > 0)
+  }));
+}
+
+/**
+ * Sprint の成果到達点として使う Epic / Workstream 一覧を取得する。
+ * DB が未設定・未共有でも日次管理本体は継続できるよう空配列へフォールバック可能なAPIにする。
+ */
+export async function fetchSprintCheckpointRecords(
+  config: AppConfig
+): Promise<SprintCheckpointRecord[]> {
+  if (!config.epicDbId && !config.epicDbUrl && !config.epicDbName) return [];
+  const epicDbId = await resolveDatabaseId(config, {
+    url: config.epicDbUrl,
+    name: config.epicDbName,
+    label: "EPIC_DB"
+  });
+  const pages = await queryDatabase(config, epicDbId, {}, 5, { silent: true });
+  const extracted = pages.map((page: any) => {
+    const props = page?.properties ?? {};
+    const taskProp = getPropertyByName(props, ["タスク", "Tasks"]);
+    const projectProp = getPropertyByName(props, ["プロジェクト", "Project"]);
+    const relationIds = (prop: any): string[] =>
+      prop?.type === "relation" && Array.isArray(prop.relation)
+        ? prop.relation
+            .map((relation: any) => relation?.id)
+            .filter((id: unknown): id is string => typeof id === "string")
+        : [];
+    const checkpointProp = getPropertyByName(props, ["次チェックポイント"]);
+    const goalProp = getPropertyByName(props, ["ゴール", "Goal"]);
+    const dueProp = getPropertyByName(props, ["チェックポイント期日"]);
+    return {
+      id: String(page?.id ?? ""),
+      name: getTitleFromProperties(props, ["名前", "Name"]),
+      kind: getStatusName(getPropertyByName(props, ["種別", "Type"])) ?? null,
+      status: getStatusName(getPropertyByName(props, ["ステータス", "Status"])) ?? null,
+      goal: titleFromRichText(goalProp?.rich_text),
+      checkpoint: titleFromRichText(checkpointProp?.rich_text),
+      checkpointDue:
+        normalizeDateString(getDateValue(dueProp)?.end ?? getDateValue(dueProp)?.start) ?? null,
+      taskIds: relationIds(taskProp),
+      projectIds: relationIds(projectProp),
+      health: getStatusName(getPropertyByName(props, ["Health", "ヘルス"])) ?? null
+    };
+  });
+  const projectTitles = await fetchPageTitles(
+    config,
+    [...new Set(extracted.flatMap((item) => item.projectIds))]
+  );
+  return extracted.map(({ projectIds, ...item }) => ({
+    ...item,
+    projectNames: projectIds
+      .map((id) => projectTitles.get(id))
+      .filter((name): name is string => typeof name === "string" && name.length > 0)
+  }));
+}
+
+/** Bot の日次判定を Epic / Workstream DB に反映する。Notion 4xx は想定内として静かに失敗させる。 */
+export async function updateCheckpointHealth(
+  config: AppConfig,
+  pageId: string,
+  update: {
+    health: string;
+    reason: string;
+    judgedDate: string;
+    sprintName: string;
+    planSp: number;
+    progressSp: number;
+    doneSp: number;
+  }
+): Promise<boolean> {
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${config.notionToken}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      properties: {
+        Health: { select: { name: update.health } },
+        判定理由: {
+          rich_text: [
+            { type: "text", text: { content: update.reason.slice(0, 1900) } }
+          ]
+        },
+        最終判定日: { date: { start: update.judgedDate } },
+        対象Sprint: {
+          rich_text: [
+            { type: "text", text: { content: update.sprintName.slice(0, 1900) } }
+          ]
+        },
+        今Sprint計画SP: { number: update.planSp },
+        今Sprint進捗SP: { number: update.progressSp },
+        今Sprint完了SP: { number: update.doneSp }
+      }
+    })
+  });
+  return res.ok;
+}
+
+// ── Delivery OS（案件採算・FTE・Forecast）───────────────────────────────
+
+const richTextValue = (prop: any): string | null => {
+  if (!prop) return null;
+  const items =
+    prop.type === "rich_text"
+      ? prop.rich_text
+      : prop.type === "title"
+        ? prop.title
+        : [];
+  const text = titleFromRichText(items);
+  return text || null;
+};
+
+const urlValue = (prop: any): string | null =>
+  prop?.type === "url" && typeof prop.url === "string" ? prop.url : null;
+
+const relationIds = (prop: any): string[] =>
+  prop?.type === "relation" && Array.isArray(prop.relation)
+    ? prop.relation
+        .map((relation: any) => relation?.id)
+        .filter((id: unknown): id is string => typeof id === "string")
+    : [];
+
+/** Notion の percent format は API 上 0.5、通常 number は 50 のことがあるため表示値へ正規化する。 */
+const asPercent = (prop: any): number | null => {
+  const value = asNumber(prop);
+  if (value == null) return null;
+  return Math.abs(value) <= 1.5 ? value * 100 : value;
+};
+
+const dateStart = (prop: any): string | null =>
+  normalizeDateString(getDateValue(prop)?.start) ?? null;
+
+const isClosedProjectStatus = (status: string | null): boolean =>
+  /完了|done|closed|cancel|中止|終了|クローズ|^チーム$/iu.test(status ?? "");
+
+const extractDeliveryProject = (page: any): DeliveryProjectRecord => {
+  const props = page?.properties ?? {};
+  const owners = [
+    ...getPeopleNames(getPropertyByName(props, ["PM"])),
+    ...getPeopleNames(getPropertyByName(props, ["担当", "担当者", "Owner"]))
+  ];
+  return {
+    id: String(page?.id ?? ""),
+    url: typeof page?.url === "string" ? page.url : "",
+    name: getTitleFromProperties(props, ["プロジェクト名", "名前", "Name"]),
+    status: getStatusName(getPropertyByName(props, ["ステータス", "Status"])) ?? null,
+    team: getStatusName(getPropertyByName(props, ["チーム", "Team"])) ?? null,
+    owners: [...new Set(owners)],
+    contractAmountManYen: asNumber(getPropertyByName(props, ["契約金額(万円)", "契約金額"])),
+    allowedHours: asNumber(getPropertyByName(props, ["許容総工数(h)", "許容工数(h)"])),
+    actualHours: asNumber(getPropertyByName(props, ["実績工数(h)", "実績工数"])),
+    remainingHours: asNumber(getPropertyByName(props, ["残工数(h)", "残工数"])),
+    forecastHours: asNumber(getPropertyByName(props, ["Forecast工数(h)", "Forecast工数", "見込工数(h)"])),
+    effortBurnPercent: asPercent(getPropertyByName(props, ["工数消化率(%)", "工数消化率"])),
+    outcomeProgressPercent: asPercent(getPropertyByName(props, ["成果進捗(%)", "成果進捗"])),
+    burnGapPoints: asPercent(getPropertyByName(props, ["Burn Gap(pt)", "Burn Gap"])),
+    revenueDensityManYenPerHour: asNumber(getPropertyByName(props, ["売上密度(万円/h)", "売上密度"])),
+    currentHealth: getStatusName(getPropertyByName(props, ["Delivery Health", "Health"])) ?? null,
+    internalDeadline: dateStart(getPropertyByName(props, ["Internal Deadline", "内部期限"])),
+    ttfvDays: asNumber(getPropertyByName(props, ["TTFV(日)", "TTFV"])),
+    evalPassPercent: asPercent(getPropertyByName(props, ["Eval合格率(%)", "Eval合格率"])),
+    nextPhaseStatus: getStatusName(getPropertyByName(props, ["次Phase状況", "次フェーズ状況"])) ?? null,
+    nextPhaseAmountManYen: asNumber(getPropertyByName(props, ["次Phase金額(万円)", "次フェーズ金額(万円)"])),
+    nextPhaseProposalDue: dateStart(getPropertyByName(props, ["次Phase提案期限", "次フェーズ提案期限"]))
+  };
+};
+
+const extractDeliveryTask = (page: any): DeliveryTaskRecord => {
+  const props = page?.properties ?? {};
+  const blocker = richTextValue(getPropertyByName(props, ["ブロッカー", "Blocker"]));
+  return {
+    id: String(page?.id ?? ""),
+    url: typeof page?.url === "string" ? page.url : "",
+    name: getTitleFromProperties(props, ["名前", "Name"]),
+    status: getStatusName(getPropertyByName(props, ["ステータス", "Status"])) ?? null,
+    assignees: getPeopleNames(getPropertyByName(props, ["担当者", "Assignee", "Owner"])),
+    projectIds: relationIds(getPropertyByName(props, ["プロジェクト", "Project"])),
+    budgetHours: asNumber(getPropertyByName(props, ["工数予算(h)", "工数予算"])),
+    actualHours: asNumber(getPropertyByName(props, ["実績工数(h)", "実績工数"])),
+    remainingHours: asNumber(getPropertyByName(props, ["残工数(h)", "残工数"])),
+    evidenceUrl: urlValue(getPropertyByName(props, ["Evidence", "エビデンス"])),
+    completionCriteria: richTextValue(getPropertyByName(props, ["完了条件", "Definition of Done"])),
+    reuseType: getStatusName(getPropertyByName(props, ["再利用区分", "Reuse Type"])) ?? null,
+    evalPercent: asPercent(getPropertyByName(props, ["Eval結果(%)", "Eval結果"])),
+    blocker,
+    blockerStartedAt: getDateValue(getPropertyByName(props, ["ブロッカー発生日"]))?.start ?? null,
+    due: dateStart(getPropertyByName(props, ["期限", "Due", "Due Date"])),
+    forecastCompletionDate: dateStart(getPropertyByName(props, ["見込完了日", "Forecast Completion"])),
+    progressUpdatedDate: dateStart(getPropertyByName(props, ["進捗更新日", "Progress Updated"])),
+    lastEditedTime: typeof page?.last_edited_time === "string" ? page.last_edited_time : null
+  };
+};
+
+/** TeamK の進行中案件と、その案件に紐づくタスクを1つのスナップショットとして取得する。 */
+export async function fetchDeliveryControlSnapshot(
+  config: AppConfig,
+  now = new Date()
+): Promise<DeliverySnapshot> {
+  if (!config.projectDbId) {
+    throw new Error("PROJECT_DB_ID is required for Delivery Control");
+  }
+  const taskDbId =
+    config.taskDbId ||
+    (await resolveDatabaseId(config, {
+      url: config.taskDbUrl,
+      name: config.taskDbName,
+      label: "TASK_DB"
+    }));
+
+  let projectPages: any[];
+  try {
+    projectPages = await queryDatabase(
+      config,
+      config.projectDbId,
+      {
+        filter: {
+          property: "チーム",
+          select: { equals: config.teamFilter }
+        }
+      },
+      5,
+      { silent: true }
+    );
+  } catch {
+    // プロパティ名や型が変わっていても全件取得→JS側filterで正常動作を維持する。
+    projectPages = await queryDatabase(config, config.projectDbId, {}, 5, { silent: true });
+  }
+  const projects = projectPages
+    .map(extractDeliveryProject)
+    .filter(
+      (project) =>
+        !isClosedProjectStatus(project.status) &&
+        (!project.team || project.team.toLowerCase() === config.teamFilter.toLowerCase())
+    );
+
+  const taskPages: any[] = [];
+  for (let offset = 0; offset < projects.length; offset += 25) {
+    const ids = projects.slice(offset, offset + 25).map((project) => project.id);
+    if (ids.length === 0) continue;
+    const filter = {
+      or: ids.map((id) => ({
+        property: "プロジェクト",
+        relation: { contains: id }
+      }))
+    };
+    const batch = await queryDatabase(config, taskDbId, { filter }, 5, { silent: true });
+    taskPages.push(...batch);
+  }
+  const uniqueTasks = new Map<string, DeliveryTaskRecord>();
+  for (const page of taskPages) {
+    const task = extractDeliveryTask(page);
+    if (task.id) uniqueTasks.set(task.id, task);
+  }
+  return {
+    today: toJstDateString(now),
+    projects,
+    tasks: [...uniqueTasks.values()]
+  };
+}
+
+/** Delivery Health select をBot判定で更新する。4xxは想定内としてログを出さない。 */
+export async function updateProjectDeliveryHealth(
+  config: AppConfig,
+  pageId: string,
+  health: "🟢 Green" | "🟡 Yellow" | "🔴 Red"
+): Promise<boolean> {
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${config.notionToken}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      properties: { "Delivery Health": { select: { name: health } } }
+    })
+  });
+  return res.ok;
+}
+
+export interface CompletedTaskInfo {
+  id: string;
+  name: string;
+  sp: number;
+  status: string | null;
+  assignees: string[];
+  completedDate: string | null;
+}
+
+/**
+ * スプリントに関係なく、「完了日」が [start, end] に入る全タスクを取得する。
+ * 複数スプリントをまたぐ期間の「担当者ごとの消化SP集計」などに使う。
+ */
+export async function fetchCompletedTasksByDateRange(
+  config: AppConfig,
+  range: { start: string; end: string }
+): Promise<CompletedTaskInfo[]> {
+  const taskDbId = await resolveDatabaseId(config, {
+    url: config.taskDbUrl,
+    name: config.taskDbName,
+    label: "TASK_DB"
+  });
+
+  const pages = await queryDatabase(
+    config,
+    taskDbId,
+    {
+      filter: {
+        and: [
+          { property: "完了日", date: { on_or_after: range.start } },
+          { property: "完了日", date: { on_or_before: range.end } }
+        ]
+      }
+    },
+    10
+  );
+
+  return pages.map((page: any) => {
+    const props = page?.properties ?? {};
+    const statusProp =
+      getPropertyByName(props, ["ステータス", "Status", "状態"]) ||
+      findPropertiesByType(props, "status")[0]?.value;
+    const assigneeProp =
+      getPropertyByName(props, ["担当者", "Assignee", "Owner"]) ||
+      (findPropertiesByType(props, "people").length === 1
+        ? findPropertiesByType(props, "people")[0].value
+        : undefined);
+    const completedProp = getPropertyByName(props, [
+      "完了日",
+      "Completed Date",
+      "Completion Date"
+    ]);
+    return {
+      id: String(page?.id ?? ""),
+      name: getTitleFromProperties(props, ["名前", "Name"]),
+      sp:
+        asNumber(props?.SP) ??
+        asNumber(props?.ポイント) ??
+        asNumber(props?.["Story Points"]) ??
+        0,
+      status: getStatusName(statusProp) ?? null,
+      assignees: getPeopleNames(assigneeProp),
+      completedDate: normalizeDateString(getDateValue(completedProp)?.start) ?? null
+    };
+  });
+}
+
+export interface MemberCapacity {
   name: string;
   totalHours: number;
   remainingHours: number;
@@ -986,6 +1624,16 @@ export async function fetchCurrentSprintInfo(
   config: AppConfig,
   now: Date
 ): Promise<SprintTasksSummary> {
+  if (!config.sprintDbUrl && !config.sprintDbName) {
+    const sprint = computeVirtualSprint(now);
+    return {
+      sprint,
+      sprint_metrics: { plan_sp: null, progress_sp: null, required_sp_per_day: null },
+      assignees: [],
+      projectIds: []
+    };
+  }
+
   const sprintDbId = await resolveDatabaseId(config, {
     url: config.sprintDbUrl,
     name: config.sprintDbName,
@@ -1006,10 +1654,10 @@ export async function fetchCurrentSprintInfo(
     throw new Error("Sprint records did not contain a valid period property");
   }
 
-  let sprint =
-    sprintCandidates.find((s) => isDateInRange(today, s.start_date, s.end_date)) ??
-    sprintCandidates.find((s) => isActiveStatus(s.status));
-  if (!sprint) sprint = sprintCandidates[0];
+  const sprint = selectCurrentSprint(sprintCandidates, today);
+  if (!sprint) {
+    throw new Error("Could not select current sprint");
+  }
 
   return {
     sprint: {
@@ -1026,8 +1674,13 @@ export async function fetchCurrentSprintInfo(
 }
 
 export async function fetchAllSprints(
-  config: AppConfig
+  config: AppConfig,
+  now?: Date
 ): Promise<Array<{ id: string; name: string; start_date: string; end_date: string; status: string }>> {
+  if (!config.sprintDbUrl && !config.sprintDbName) {
+    return computeVirtualSprintHistory(8, now ?? new Date());
+  }
+
   const sprintDbId = await resolveDatabaseId(config, {
     url: config.sprintDbUrl,
     name: config.sprintDbName,
@@ -1096,9 +1749,10 @@ export interface TaskProperties {
   assignees: string[];
   due: string | null;
   sp: number | null;
+  project: string | null;
 }
 
-/** 単一ページの主要プロパティ（名前・ステータス・担当者・期限・SP）を取得。Notion webhook の変更検出用。 */
+/** 単一ページの主要プロパティ（名前・ステータス・担当者・期限・SP・プロジェクト）を取得。Notion webhook の変更検出用。 */
 export async function fetchTaskPropertiesById(
   config: AppConfig,
   pageId: string
@@ -1120,7 +1774,14 @@ export async function fetchTaskPropertiesById(
     // レンジ期限は終了日が締切。snapshot 等と桁を揃えるため YYYY-MM-DD に正規化。
     const due = normalizeDateString(dateVal?.end ?? dateVal?.start) ?? null;
     const sp = asNumber(getPropertyByName(props, ["SP", "sp"]));
-    return { name, status, assignees, due, sp };
+    const projectProp = getPropertyByName(props, ["プロジェクト", "Project"]);
+    const projectId =
+      projectProp?.type === "relation" && Array.isArray(projectProp.relation)
+        ? projectProp.relation[0]?.id
+        : undefined;
+    const projectTitles = projectId ? await fetchPageTitles(config, [projectId]) : new Map<string, string>();
+    const project = projectId ? projectTitles.get(projectId) ?? null : null;
+    return { name, status, assignees, due, sp, project };
   } catch (err) {
     console.warn(`fetchTaskPropertiesById error: ${(err as Error).message}`);
     return null;

@@ -7,6 +7,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "test:kpi-progress": "npx -y tsx scripts/test-kpi-progress.ts",
+    "test:sp-dashboard": "npx -y tsx scripts/test-sp-gamification.ts",
+    "test:delivery-control": "npx -y tsx scripts/test-delivery-control.ts",
+    "test:sprint-planning": "npx -y tsx scripts/test-sprint-planning-assistant.ts",
     "loop:audit": "npx -y @cobusgreyling/loop-audit . --suggest",
     "loop:cost": "npx -y @cobusgreyling/loop-cost --pattern daily-triage --level L1"
   },

@@ -15,6 +15,20 @@ interface PageUpdates {
   assigneeId?: string;
   /** 複数担当者の解決済み Notion user ID 配列。assigneeId より優先。 */
   assigneeIds?: string[];
+  /** Daily Update: 累積実績工数 */
+  actualHours?: number;
+  /** Daily Update: 現在の残工数 */
+  remainingHours?: number;
+  /** Daily Update: YYYY-MM-DD */
+  progressUpdatedDate?: string;
+  /** 完了時の確定日。nullで消す。 */
+  completedDate?: string | null;
+  /** 空文字でブロッカーを解除する */
+  blocker?: string;
+  /** null で日付を消す */
+  blockerStartedAt?: string | null;
+  /** null でURLを消す */
+  evidenceUrl?: string | null;
 }
 
 // ── Notion user ID mapping (name → ID) ─────────────────────────────────────
@@ -218,8 +232,92 @@ export async function updateTaskPage(
     }
   }
 
+  if (updates.actualHours !== undefined) {
+    properties["実績工数(h)"] = { number: updates.actualHours };
+  }
+  if (updates.remainingHours !== undefined) {
+    properties["残工数(h)"] = { number: updates.remainingHours };
+  }
+  if (updates.progressUpdatedDate !== undefined) {
+    properties["進捗更新日"] = { date: { start: updates.progressUpdatedDate } };
+  }
+  if (updates.completedDate !== undefined) {
+    properties["完了日"] = {
+      date: updates.completedDate ? { start: updates.completedDate } : null
+    };
+  }
+  if (updates.blocker !== undefined) {
+    properties["ブロッカー"] = {
+      rich_text: updates.blocker
+        ? [{ type: "text", text: { content: updates.blocker.slice(0, 1900) } }]
+        : []
+    };
+  }
+  if (updates.blockerStartedAt !== undefined) {
+    properties["ブロッカー発生日"] = {
+      date: updates.blockerStartedAt ? { start: updates.blockerStartedAt } : null
+    };
+  }
+  if (updates.evidenceUrl !== undefined) {
+    properties["Evidence"] = { url: updates.evidenceUrl || null };
+  }
+
   if (Object.keys(properties).length === 0) return;
   await patchPage(token, pageId, properties);
+}
+
+/** SlackのDaily Updateから、タスクページ末尾へ次アクションを追記する。 */
+export async function appendDailyUpdateLog(
+  token: string,
+  pageId: string,
+  input: { date: string; status: string; nextAction: string }
+): Promise<void> {
+  if (!input.nextAction.trim()) return;
+  await withRetry(
+    async () => {
+      const res = await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": NOTION_VERSION,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          children: [
+            {
+              object: "block",
+              type: "paragraph",
+              paragraph: {
+                rich_text: [
+                  {
+                    type: "text",
+                    text: {
+                      content: `[Daily Update ${input.date}] ${input.status}｜次: ${input.nextAction}`.slice(0, 1900)
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`Notion appendDailyUpdateLog error [${pageId}]: ${res.status} ${detail}`);
+      }
+    },
+    { label: `Notion appendDailyUpdateLog ${pageId}` }
+  );
+}
+
+export async function updateTaskSprintClass(
+  token: string,
+  pageId: string,
+  sprintClass: "Commit" | "Stretch" | "途中追加" | "持越し"
+): Promise<void> {
+  await patchPage(token, pageId, {
+    "Sprint区分": { select: { name: sprintClass } }
+  });
 }
 
 export async function updateTaskProject(

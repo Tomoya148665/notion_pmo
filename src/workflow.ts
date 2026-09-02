@@ -67,6 +67,169 @@ const MENTION_HISTORY_KEY = (channel: string, threadTs: string) =>
 
 const DEFAULT_TTL = 7 * 24 * 3600;
 
+// ── 30秒 Daily Update ─────────────────────────────────────────────────────
+
+export interface DailyCheckinTask {
+  id: string;
+  url: string;
+  name: string;
+  status: string | null;
+  evidenceUrl: string | null;
+  blockerStartedAt: string | null;
+}
+
+export interface DailyCheckinSession {
+  id: string;
+  date: string;
+  channel: string;
+  threadTs: string;
+  assignee: string;
+  slackUserId?: string;
+  tasks: DailyCheckinTask[];
+}
+
+const DAILY_CHECKIN_SESSION_KEY = (id: string) => `daily-checkin:${id}`;
+const DAILY_CHECKIN_DONE_KEY = (date: string, taskId: string) =>
+  `daily-checkin-done:${date}:${taskId.replace(/-/g, "")}`;
+
+export async function saveDailyCheckinSession(
+  kv: KVNamespace,
+  session: DailyCheckinSession
+): Promise<void> {
+  await kv.put(DAILY_CHECKIN_SESSION_KEY(session.id), JSON.stringify(session), {
+    expirationTtl: 2 * 24 * 3600
+  });
+}
+
+export async function getDailyCheckinSession(
+  kv: KVNamespace,
+  id: string
+): Promise<DailyCheckinSession | null> {
+  const raw = await kv.get(DAILY_CHECKIN_SESSION_KEY(id)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as DailyCheckinSession;
+  } catch {
+    return null;
+  }
+}
+
+export async function markDailyCheckinDone(
+  kv: KVNamespace,
+  date: string,
+  taskId: string
+): Promise<void> {
+  await kv.put(DAILY_CHECKIN_DONE_KEY(date, taskId), new Date().toISOString(), {
+    expirationTtl: DEFAULT_TTL
+  });
+}
+
+export async function isDailyCheckinDone(
+  kv: KVNamespace,
+  date: string,
+  taskId: string
+): Promise<boolean> {
+  return Boolean(await kv.get(DAILY_CHECKIN_DONE_KEY(date, taskId)).catch(() => null));
+}
+
+// ── Sprint Planning baseline / scope control ──────────────────────────────
+
+export interface SprintPlanTaskSnapshot {
+  id: string;
+  name: string;
+  sp: number;
+  budgetHours: number | null;
+  sprintClass: string | null;
+  recommendedClass: "Commit" | "Stretch";
+}
+
+export interface SprintPlanBaseline {
+  sprintId: string;
+  sprintName: string;
+  startDate: string;
+  endDate: string;
+  lockedAt: string;
+  lockedBy: string;
+  totalSp: number;
+  totalHours: number;
+  tasks: SprintPlanTaskSnapshot[];
+}
+
+export interface SprintPlanLockSession {
+  id: string;
+  channel: string;
+  messageTs: string;
+  threadTs?: string;
+  baseline: SprintPlanBaseline;
+}
+
+const SPRINT_PLAN_BASELINE_KEY = (sprintId: string) =>
+  `sprint-plan-baseline:${sprintId.replace(/-/g, "")}`;
+const SPRINT_PLAN_LOCK_KEY = (id: string) => `sprint-plan-lock:${id}`;
+const SPRINT_SCOPE_FINGERPRINT_KEY = (sprintId: string) =>
+  `sprint-scope:${sprintId.replace(/-/g, "")}`;
+
+export async function saveSprintPlanBaseline(
+  kv: KVNamespace,
+  baseline: SprintPlanBaseline
+): Promise<void> {
+  await kv.put(SPRINT_PLAN_BASELINE_KEY(baseline.sprintId), JSON.stringify(baseline), {
+    expirationTtl: 120 * 24 * 3600
+  });
+}
+
+export async function getSprintPlanBaseline(
+  kv: KVNamespace,
+  sprintId: string
+): Promise<SprintPlanBaseline | null> {
+  const raw = await kv.get(SPRINT_PLAN_BASELINE_KEY(sprintId)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SprintPlanBaseline;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveSprintPlanLockSession(
+  kv: KVNamespace,
+  session: SprintPlanLockSession
+): Promise<void> {
+  await kv.put(SPRINT_PLAN_LOCK_KEY(session.id), JSON.stringify(session), {
+    expirationTtl: 2 * 24 * 3600
+  });
+}
+
+export async function getSprintPlanLockSession(
+  kv: KVNamespace,
+  id: string
+): Promise<SprintPlanLockSession | null> {
+  const raw = await kv.get(SPRINT_PLAN_LOCK_KEY(id)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SprintPlanLockSession;
+  } catch {
+    return null;
+  }
+}
+
+export async function getSprintScopeFingerprint(
+  kv: KVNamespace,
+  sprintId: string
+): Promise<string | null> {
+  return await kv.get(SPRINT_SCOPE_FINGERPRINT_KEY(sprintId)).catch(() => null);
+}
+
+export async function saveSprintScopeFingerprint(
+  kv: KVNamespace,
+  sprintId: string,
+  fingerprint: string
+): Promise<void> {
+  await kv.put(SPRINT_SCOPE_FINGERPRINT_KEY(sprintId), fingerprint, {
+    expirationTtl: 120 * 24 * 3600
+  });
+}
+
 export async function saveThreadState(
   kv: KVNamespace,
   channel: string,
@@ -441,6 +604,44 @@ export async function getTaskSnapshot(
   }
 }
 
+// ── タスク完了ログ (ステータス→完了 検知時の正確な日時を永続記録) ──────────────
+//   完了日 Notion プロパティが未入力のタスクでも、webhook でステータス変更を検知した
+//   瞬間の時刻を正として残す。TTL なし = 永続保存（KV 容量が問題になるまで削除不要）。
+export interface TaskCompletionRecord {
+  pageId: string;
+  name: string;
+  sp: number | null;
+  assignees: string[];
+  project: string | null;
+  completedAt: string; // ISO8601 (UTC)
+}
+
+const TASK_COMPLETION_KEY_PREFIX = "task-completed:";
+const TASK_COMPLETION_KEY = (pageId: string) =>
+  `${TASK_COMPLETION_KEY_PREFIX}${pageId.replace(/-/g, "")}`;
+
+export async function recordTaskCompletion(
+  kv: KVNamespace,
+  pageId: string,
+  record: Omit<TaskCompletionRecord, "pageId">
+): Promise<void> {
+  await kv.put(TASK_COMPLETION_KEY(pageId), JSON.stringify({ pageId, ...record }));
+}
+
+export async function listTaskCompletions(kv: KVNamespace): Promise<TaskCompletionRecord[]> {
+  const results: TaskCompletionRecord[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await kv.list({ prefix: TASK_COMPLETION_KEY_PREFIX, cursor });
+    for (const key of page.keys) {
+      const raw = await kv.get(key.name, "json").catch(() => null);
+      if (raw) results.push(raw as TaskCompletionRecord);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return results;
+}
+
 // 当日の「MM/DD_タスク」スレッドの threadTs（完了通知をチャンネルでなくこのスレッドに入れる用）
 const CURRENT_TASK_THREAD_KEY = (channel: string) => `current-task-thread:${channel}`;
 
@@ -457,6 +658,105 @@ export async function getCurrentTaskThread(
   channel: string
 ): Promise<string | null> {
   return (await kv.get(CURRENT_TASK_THREAD_KEY(channel)).catch(() => null)) || null;
+}
+
+// ── KPI 詰めスレッド状態（実行担保エンジン） ─────────────────────────────
+// 1つの共有スレッドに複数人の案件が同居するため、スレッド単位ではなく発言者の
+// Slack ユーザーIDでインシデントを引く。
+export interface KpiIncidentItem {
+  itemKey: string;
+  kpiText: string;
+  triggerKind: string;
+  detail: string;
+}
+
+/** インシデント内の会話1ターン（Botのナッジ/返答 or 本人の返信）。LLM判定の文脈として使う。 */
+export interface KpiConversationTurn {
+  role: "bot" | "member";
+  text: string;
+  at: string;
+}
+
+export interface KpiIncident {
+  member: string;
+  items: KpiIncidentItem[];
+  openedAt: string;
+  pressCount: number;
+  lastPromptAt: string;
+  resolved: boolean;
+  /** 当日のやり取りの履歴（直近16ターン、各400字まで）。二度聞き・文脈喪失を防ぐ。 */
+  conversation?: KpiConversationTurn[];
+}
+
+/** 会話履歴に1ターン追加して直近16ターンに丸める（テキストは400字まで）。 */
+export function appendConversationTurn(
+  conversation: KpiConversationTurn[] | undefined,
+  role: "bot" | "member",
+  text: string
+): KpiConversationTurn[] {
+  return [...(conversation ?? []), { role, text: text.slice(0, 400), at: new Date().toISOString() }].slice(-16);
+}
+
+export interface KpiThreadState {
+  channel: string;
+  parentTs: string;
+  date: string;
+  incidents: Record<string, KpiIncident>; // key = Slack user ID
+}
+
+const KPI_THREAD_KEY = (channel: string, ts: string) => `kpi-thread:${channel}:${ts}`;
+
+export async function saveKpiThreadState(
+  kv: KVNamespace,
+  channel: string,
+  ts: string,
+  state: KpiThreadState,
+  ttlSeconds = DEFAULT_TTL
+): Promise<void> {
+  await kv.put(KPI_THREAD_KEY(channel, ts), JSON.stringify(state), { expirationTtl: ttlSeconds });
+}
+
+export async function getKpiThreadState(
+  kv: KVNamespace,
+  channel: string,
+  ts: string
+): Promise<KpiThreadState | null> {
+  const raw = await kv.get(KPI_THREAD_KEY(channel, ts)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as KpiThreadState;
+  } catch {
+    return null;
+  }
+}
+
+// 当日の「MM/DD_KPI」スレッドの参照（25:00の表投稿をこのスレッドに返信するため）
+export interface TodayKpiThreadRef {
+  parentTs: string;
+  date: string;
+}
+const KPI_THREAD_TODAY_KEY = (channel: string) => `kpi-thread-today:${channel}`;
+
+export async function saveTodayKpiThreadRef(
+  kv: KVNamespace,
+  channel: string,
+  ref: TodayKpiThreadRef,
+  ttlSeconds = SNAPSHOT_TTL
+): Promise<void> {
+  await kv.put(KPI_THREAD_TODAY_KEY(channel), JSON.stringify(ref), { expirationTtl: ttlSeconds });
+}
+
+export async function getTodayKpiThreadRef(
+  kv: KVNamespace,
+  channel: string
+): Promise<TodayKpiThreadRef | null> {
+  const raw = await kv.get(KPI_THREAD_TODAY_KEY(channel)).catch(() => null);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as TodayKpiThreadRef;
+  } catch {
+    return null;
+  }
 }
 
 // 当日の各タスクの「朝(8:30)の起点」プロパティ。24:00 サマリーで1日の進捗SP変動を出す用。

@@ -557,3 +557,85 @@ export const replyEvaluationJsonSchema = {
     required: ["is_valid"]
   }
 };
+
+// ── KPI cadence inference schema ────────────────────────────────────────
+
+export const kpiCadenceSchema = z.object({
+  kind: z.enum(["daily", "weekdays", "weekly_count", "none"]),
+  weekdays: z.array(z.number().int().min(0).max(6)).optional().nullable(),
+  count_per_week: z.number().int().optional().nullable(),
+  count_unit: z.string().optional().nullable(),
+  confidence: z.enum(["high", "medium", "low"]),
+  rationale: z.string()
+});
+export type KpiCadenceLlmResult = z.infer<typeof kpiCadenceSchema>;
+export const kpiCadenceJsonSchema = {
+  name: "KpiCadence",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      kind: { type: "string", enum: ["daily", "weekdays", "weekly_count", "none"] },
+      weekdays: { type: ["array", "null"], items: { type: "integer", minimum: 0, maximum: 6 } },
+      count_per_week: { type: ["integer", "null"] },
+      count_unit: { type: ["string", "null"] },
+      confidence: { type: "string", enum: ["high", "medium", "low"] },
+      rationale: { type: "string" }
+    },
+    required: ["kind", "weekdays", "count_per_week", "count_unit", "confidence", "rationale"]
+  }
+};
+
+// ── KPI grilling reply judgment schema ───────────────────────────────────
+
+export const kpiReplyJudgmentSchema = z.object({
+  satisfied_item_keys: z.array(z.string()),
+  extracted_commitment: z
+    .object({
+      date: z.string(),
+      what: z.string(),
+      item_keys: z.array(z.string())
+    })
+    .nullable(),
+  extracted_excuse: z
+    .object({
+      text: z.string(),
+      item_keys: z.array(z.string())
+    })
+    .nullable(),
+  response_text: z.string()
+});
+export type KpiReplyJudgment = z.infer<typeof kpiReplyJudgmentSchema>;
+export const kpiReplyJudgmentJsonSchema = {
+  name: "KpiReplyJudgment",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      satisfied_item_keys: { type: "array", items: { type: "string" } },
+      extracted_commitment: {
+        type: ["object", "null"],
+        additionalProperties: false,
+        properties: {
+          date: { type: "string" },
+          what: { type: "string" },
+          item_keys: { type: "array", items: { type: "string" } }
+        },
+        required: ["date", "what", "item_keys"]
+      },
+      extracted_excuse: {
+        type: ["object", "null"],
+        additionalProperties: false,
+        properties: {
+          text: { type: "string" },
+          item_keys: { type: "array", items: { type: "string" } }
+        },
+        required: ["text", "item_keys"]
+      },
+      response_text: { type: "string" }
+    },
+    required: ["satisfied_item_keys", "extracted_commitment", "extracted_excuse", "response_text"]
+  }
+};

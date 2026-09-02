@@ -1,4 +1,4 @@
-import { getConfig, type Bindings, type AppConfig } from "./config";
+import { getConfig, resolveTeamKChannelId, type Bindings, type AppConfig } from "./config";
 import { listAllChannelConfigs, resolveConfig } from "./channelConfig";
 import { buildDedupKey, hashPayload, isDuplicateAndRemember } from "./dedupe";
 import { fetchSprintSummary, fetchFreeText, fetchSprintTasks } from "./notionMcp";
@@ -22,24 +22,96 @@ import {
   fetchTasksByDueRange,
   fetchAllSprints,
   fetchSprintBurndownTasks,
+  fetchSprintDashboardTasks,
+  fetchSprintCheckpointRecords,
+  updateCheckpointHealth,
+  fetchCompletedTasksByDateRange,
   isCompletedStatus,
-  fetchTaskPropertiesById
+  type SprintDashboardTask,
+  statusProgressRate,
+  fetchTaskPropertiesById,
+  fetchDeliveryControlSnapshot,
+  updateProjectDeliveryHealth
 } from "./notionApi";
 import { buildBurndownSeries, buildBurndownPng, renderBurndownHtml } from "./burndown";
-import { handleSlackEvents } from "./slackEvents";
-import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons, buildReminderDeliveryButtons } from "./slackInteractions";
+import {
+  buildCurrentSpSnapshot,
+  buildSpDashboardData,
+  calculateSprintVelocity,
+  buildSpDashboardPng,
+  buildSpTaskDetailData,
+  buildCombinedDashboardPng,
+  spTaskDetailCanvasHeight,
+  buildSpTaskDetailsPng,
+  generateAiDashboardBackground,
+  loadSpDashboardHistory,
+  renderSpDashboardHtml,
+  renderSpTaskDetailsHtml,
+  saveSpDashboardSnapshot,
+  spDashboardSlackComment,
+  sprintPlanningSlackComment,
+  spTaskDetailsSlackComment,
+  type SpDashboardData,
+  type SpTaskDetailData,
+  type SprintDashboardInfo
+} from "./spGamification";
+import { handleSlackEvents, processKpiReply } from "./slackEvents";
+import {
+  handleSlackInteractions,
+  buildPmReportButtons,
+  buildEodReminderButtons,
+  buildReminderDeliveryButtons,
+  buildDailyCheckinButton,
+  buildSprintPlanLockButton
+} from "./slackInteractions";
 import { fetchMembers } from "./memberApi";
+import {
+  fetchScrumTable,
+  buildLivePlay,
+  dateColumnIndex,
+  emptyMembersForColumn,
+  kpiTextColumnIndex,
+  skillCategoryColumnIndex,
+  formatMemberDaySymbols,
+  buildWeeklyBoardNarration,
+  type ScrumTable
+} from "./s19Scrum";
+import { getOrInferCadence } from "./kpiCadence";
+import {
+  computeKpiRiskAssessment,
+  resolvePendingCommitments,
+  computeStreaksAndPraise,
+  type KpiRowContext
+} from "./kpiRisk";
+import { getKpiMemory, recentForItem, markCommitmentOutcome, clearKpiMemory, type KpiMemberMemory } from "./kpiMemory";
 import {
   analyzeTasksAndMembers,
   generateAssigneeMessages,
   interpretRepliesAndPropose,
-  matchTasksToSchedule
+  matchTasksToSchedule,
+  generateKpiNudge
 } from "./llmAnalyzer";
-import { chatPostMessage, conversationsOpen, uploadImageToSlack, bulletListBlocks } from "./slackBot";
+import { chatPostMessage, conversationsOpen, uploadImageToSlack, uploadMultipleImagesToSlack, deleteSlackMessage, bulletListBlocks, findChannelIdByName, conversationsReplies } from "./slackBot";
 import { refreshProjectCatalog, getCachedProjects } from "./projectCatalog";
 import { refreshUserCatalog, getCachedUsers, ensureUserCatalog, resolveSlackUserIdByName, resolveMemberByName } from "./userCatalog";
-import { buildTimelinePng, renderTimelineHtml } from "./timeline";
-import { captureAssigneeBoards, captureNotionTimeline, captureNotionTimelineDebug, fetchNotionAvatarMap, getNotionSession, DEFAULT_NOTION_BOARD_URL, DEFAULT_NOTION_TIMELINE_URL } from "./notionBoard";
+import { buildTimelinePng, htmlToPng, renderTimelineHtml } from "./timeline";
+import {
+  assessSnapshot,
+  calculateAssigneeCapacity,
+  collectAssigneeUpdateGaps,
+  collectExpansionReminders,
+  deliveryAlertFingerprint,
+  renderDeliveryAlerts,
+  renderDeliveryDashboardHtml,
+  renderDeliveryDigest,
+  renderExpansionReminders,
+  renderPortfolioSummary,
+  renderUpdateReminder,
+  isDailyUpdateTask,
+  type DeliverySnapshot,
+  type ProjectAssessment
+} from "./deliveryControl";
+import { captureAssigneeBoards, captureNotionTimeline, captureNotionTimelineDebug, captureNotionPage, debugNotionPageInfo, debugNotionRedirectTrap, debugNotionTableMeasure, probeBrowserCapabilities, fetchNotionAvatarMap, getNotionSession, DEFAULT_NOTION_BOARD_URL, DEFAULT_NOTION_TIMELINE_URL } from "./notionBoard";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -58,12 +130,38 @@ import {
   markCronAlertSent,
   saveTaskSnapshot,
   getTaskSnapshot,
+  recordTaskCompletion,
+  listTaskCompletions,
+  type TaskCompletionRecord,
   saveCurrentTaskThread,
   getCurrentTaskThread,
   saveDayStartProgress,
   getDayStartProgress,
-  type DayStartEntry
+  type DayStartEntry,
+  saveKpiThreadState,
+  getKpiThreadState,
+  saveTodayKpiThreadRef,
+  getTodayKpiThreadRef,
+  appendConversationTurn,
+  type KpiThreadState,
+  type KpiIncident,
+  type KpiIncidentItem,
+  saveDailyCheckinSession,
+  saveSprintPlanLockSession,
+  getSprintPlanBaseline,
+  getSprintScopeFingerprint,
+  saveSprintScopeFingerprint,
+  type SprintPlanBaseline
 } from "./workflow";
+import { updateTaskSprintClass } from "./notionWriter";
+import {
+  buildSprintPlanningDraft,
+  renderSprintPlanningDraft,
+  toSprintPlanTaskSnapshots,
+  buildSprintScopeDiff,
+  renderSprintScopeDiff,
+  type SprintScopeDiff
+} from "./sprintPlanningAssistant";
 
 interface Env extends Bindings {}
 
@@ -437,6 +535,7 @@ async function buildSprintTasksMeta(
   const yesterdayKey = toJstDateString(now, -1);
   const snapshotKey = `sprint-task-snapshot:${summary.sprint.id}:${todayKey}`;
   const previousKey = `sprint-task-snapshot:${summary.sprint.id}:${yesterdayKey}`;
+  // 未完了タスクのスナップショット（表示・変更検出用）
   const currentSnapshot = summary.assignees.flatMap((assignee) =>
     assignee.tasks.map((task) => ({
       id: task.id,
@@ -445,6 +544,15 @@ async function buildSprintTasksMeta(
       sp: task.sp ?? null
     }))
   );
+
+  // 完了タスクも含めたスナップショットをKVに保存（calculateAvgDailySpConsumption が完了への遷移を検出するため）
+  const fullSummary = await fetchCurrentSprintTasksSummary(config, now, { includeCompleted: true }).catch(() => null);
+  const completedForSnapshot = (fullSummary?.assignees ?? [])
+    .flatMap((a) => a.tasks)
+    .filter((t) => isCompletedStatus(t.status ?? null))
+    .map((t) => ({ id: t.id, name: t.name, status: t.status ?? null, sp: t.sp ?? null }));
+  const fullSnapshot = [...currentSnapshot, ...completedForSnapshot];
+
   const previousSnapshot =
     ((await env.NOTIFY_CACHE.get(previousKey, "json")) as
       | typeof currentSnapshot
@@ -466,8 +574,17 @@ async function buildSprintTasksMeta(
       totalProgressSp += task.sp;
     }
   }
+  // 前日スナップショットにいて今日のスナップショットにいないタスク = 完了して消えた
+  for (const [taskId, prevTask] of previousById) {
+    if (!fullSnapshot.find((t) => t.id === taskId) && isCompletedStatus(null) === false) {
+      if (prevTask.sp && !isCompletedStatus(prevTask.status)) {
+        changeItems.push(`• ${dateLabel} ${prevTask.name} → 完了（スナップショット外）`);
+        totalProgressSp += prevTask.sp;
+      }
+    }
+  }
 
-  await env.NOTIFY_CACHE.put(snapshotKey, JSON.stringify(currentSnapshot), {
+  await env.NOTIFY_CACHE.put(snapshotKey, JSON.stringify(fullSnapshot), {
     expirationTtl: config.dedupeTtlSeconds
   });
 
@@ -1358,31 +1475,20 @@ async function runTaskReminderFlow(
  * 24:00(翌0時)に、その日の各メンバーの進捗SPと進捗のあったタスクを当日スレッドに投稿する。
  * 朝(8:30)の起点(day-start)と現在値を比較し、進捗SPが増えたタスクを担当者ごとに列挙（メンションなし・名前のみ）。
  */
-async function runDailyProgressSummary(env: Env, reason: string): Promise<Record<string, unknown>> {
+async function runDailyProgressSummary(env: Env, reason: string, channelId?: string): Promise<Record<string, unknown>> {
   const config = getConfig(env);
   if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
-  const channel = config.slackPmoChannelId ?? "";
+  const channel = channelId || config.slackPmoChannelId || "";
   if (!channel) return { ok: true, skipped: true, reason: "no channel" };
 
   const now = new Date();
   // 24:00(翌0時)に走るので、集計対象の「その日」は前日。manual テスト時は当日。
   const summaryDate = toJstDateString(now, reason === "manual" ? 0 : -1);
+  const threadTs = (await getCurrentTaskThread(env.NOTIFY_CACHE, channel)) ?? undefined;
   const dayStart = await getDayStartProgress(env.NOTIFY_CACHE, summaryDate);
   if (Object.keys(dayStart).length === 0) {
     console.log(`Daily progress summary: no day-start data for ${summaryDate}, skip`);
-    return { ok: true, skipped: true, reason: "no day-start" };
-  }
-  const threadTs = (await getCurrentTaskThread(env.NOTIFY_CACHE, channel)) ?? undefined;
-
-  // 朝(8:30)と同じ【スケジュール分析】を 24:00 にも当日スレッドに送る。
-  const sprintSummary = await fetchCurrentSprintTasksSummary(config, now).catch(() => null);
-  if (sprintSummary) {
-    const spc = await calculateAvgDailySpConsumption(env.NOTIFY_CACHE, sprintSummary.sprint.id, summaryDate).catch(() => null);
-    let avgDailySp: number | null = spc ? spc.avgDailySp : null;
-    if (avgDailySp == null) avgDailySp = calcAvgDailySpFromSprint(sprintSummary, summaryDate);
-    const analysis = buildScheduleAnalysis(sprintSummary, avgDailySp, summaryDate);
-    await chatPostMessage(config.slackBotToken, channel, analysis, undefined, threadTs).catch(() => {});
-    console.log(`Daily progress summary: posted schedule analysis for ${summaryDate}`);
+    return { ok: true, skipped: true, reason: "no day-start", threadTs: threadTs ?? null };
   }
 
   // 現在のタスク（期限が今日-3〜今日+10）
@@ -1480,7 +1586,1391 @@ async function runDailyProgressSummary(env: Env, reason: string): Promise<Record
     }
   }
 
-  return { ok: true, members: byAssignee.size };
+  return { ok: true, members: byAssignee.size, threadTs: threadTs ?? null };
+}
+
+function normalizeSprintName(value: string): string {
+  return value.toLowerCase().replace(/[\s　_-]/g, "");
+}
+
+/** Slack sectionの3000文字上限を越えないよう、改行単位で分割する。 */
+function slackSectionBlocks(text: string, maxChars = 2900): unknown[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.length <= maxChars ? rawLine : rawLine.slice(0, maxChars);
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > maxChars && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = next;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.map((chunk) => ({
+    type: "section",
+    text: { type: "mrkdwn", text: chunk }
+  }));
+}
+
+async function prepareSpGamificationDashboard(
+  env: Env,
+  opts: {
+    reportDate: string;
+    sprintName?: string | null;
+    persistSnapshot: boolean;
+  }
+): Promise<{
+  data: SpDashboardData;
+  details: SpTaskDetailData;
+  taskCount: number;
+  tasks: SprintDashboardTask[];
+  checkpointRecords: Awaited<ReturnType<typeof fetchSprintCheckpointRecords>>;
+}> {
+  const config = getConfig(env);
+  const sprints = await fetchAllSprints(config);
+  const sprint =
+    (opts.sprintName
+      ? sprints.find(
+          (candidate) =>
+            normalizeSprintName(candidate.name) === normalizeSprintName(opts.sprintName ?? "")
+        )
+      : undefined) ??
+    sprints.find(
+      (candidate) =>
+        candidate.start_date <= opts.reportDate && opts.reportDate <= candidate.end_date
+    ) ??
+    sprints.find((candidate) => /進行中|active|in progress/i.test(candidate.status));
+  if (!sprint) {
+    throw new Error(`sprint not found for ${opts.reportDate}`);
+  }
+
+  const dashboardSprint: SprintDashboardInfo = sprint;
+  const tasks = await fetchSprintDashboardTasks(config, sprint.id);
+  const checkpointRecords = await fetchSprintCheckpointRecords(config).catch(() => []);
+  const previousSprints = sprints
+    .filter((candidate) => candidate.end_date < dashboardSprint.start_date)
+    .sort((a, b) => b.end_date.localeCompare(a.end_date))
+    .slice(0, 3);
+  const historicalSprintTasks: Array<{
+    sprint: SprintDashboardInfo;
+    tasks: SprintDashboardTask[];
+  }> = [];
+  // Notion API のレート上限を避けるため、直近3Sprintは順番に取得する。
+  for (const previousSprint of previousSprints) {
+    const previousTasks = await fetchSprintDashboardTasks(
+      config,
+      previousSprint.id,
+      { resolveProjects: false }
+    ).catch(() => []);
+    historicalSprintTasks.push({ sprint: previousSprint, tasks: previousTasks });
+  }
+  const velocity = calculateSprintVelocity(historicalSprintTasks);
+  const history = await loadSpDashboardHistory(env.NOTIFY_CACHE, sprint.id);
+  let mergedHistory = history;
+  if (opts.persistSnapshot) {
+    const current = buildCurrentSpSnapshot(
+      dashboardSprint,
+      tasks,
+      opts.reportDate
+    );
+    mergedHistory = await saveSpDashboardSnapshot(
+      env.NOTIFY_CACHE,
+      current,
+      history
+    );
+  }
+  // スプリント開始日のタスクスナップショットを「開始時ステータス」として使う
+  // なければ近隣日付を順に試みる（最大3日後まで）
+  let startStatusMap = new Map<string, string>();
+  for (let offset = 0; offset <= 3; offset++) {
+    const d = new Date(dashboardSprint.start_date + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() + offset);
+    const dateKey = d.toISOString().slice(0, 10);
+    const raw = await env.NOTIFY_CACHE.get(
+      `sprint-task-snapshot:${dashboardSprint.id}:${dateKey}`,
+      "json"
+    ) as Array<{ id: string; status: string | null }> | null;
+    if (raw && raw.length > 0) {
+      startStatusMap = new Map(raw.map((t) => [t.id, t.status ?? "—"]));
+      break;
+    }
+  }
+
+  const data = buildSpDashboardData(
+    dashboardSprint,
+    tasks,
+    opts.reportDate,
+    mergedHistory,
+    undefined,
+    { velocity, checkpointRecords }
+  );
+  if (opts.persistSnapshot && data.checkpoints.length > 0) {
+    await Promise.all(
+      data.checkpoints.map((checkpoint) =>
+        updateCheckpointHealth(
+          config,
+          checkpoint.id,
+          {
+            health:
+              checkpoint.health === "green"
+                ? "🟢 On Track"
+                : checkpoint.health === "yellow"
+                ? "🟡 At Risk"
+                : checkpoint.health === "red"
+                ? "🔴 Off Track"
+                : "⚪ 未評価",
+            reason: checkpoint.reason,
+            judgedDate: data.reportDate,
+            sprintName: data.sprint.name,
+            planSp: checkpoint.planSp,
+            progressSp: checkpoint.progressSp,
+            doneSp: checkpoint.doneSp
+          }
+        ).catch(() => false)
+      )
+    );
+  }
+
+  return {
+    data,
+    details: buildSpTaskDetailData(
+      dashboardSprint,
+      tasks,
+      opts.reportDate,
+      startStatusMap
+    ),
+    taskCount: tasks.length,
+    tasks,
+    checkpointRecords
+  };
+}
+
+/** 土曜のSprint開始時に、Checkpoint・タスク品質・Velocity負荷をPlanning順で案内する。 */
+async function runSprintPlanningFlow(
+  env: Env,
+  reason: string,
+  channelId?: string
+): Promise<Record<string, unknown>> {
+  try {
+    const config = getConfig(env);
+    const channel = channelId || resolveTeamKChannelId(env);
+    if (!config.slackBotToken || !channel) {
+      return { ok: true, skipped: true, reason: "missing Slack config" };
+    }
+    const reportDate = toJstDateString(new Date());
+    const { data, tasks, checkpointRecords } = await prepareSpGamificationDashboard(env, {
+      reportDate,
+      persistSnapshot: false
+    });
+    const capacities = data.sprint.id.startsWith("virtual-")
+      ? []
+      : await fetchSprintCapacity(config, data.sprint.id).catch(() => []);
+    const draft = buildSprintPlanningDraft(
+      data.sprint,
+      tasks,
+      capacities,
+      checkpointRecords,
+      data.historicalVelocitySp
+    );
+    const threadTs = await getCurrentTaskThread(env.NOTIFY_CACHE, channel).catch(() => null);
+    const message = `${sprintPlanningSlackComment(data)}\n\n${renderSprintPlanningDraft(draft)}`;
+    const sessionId = crypto.randomUUID();
+    const planTasks = toSprintPlanTaskSnapshots(draft);
+    const baseline: SprintPlanBaseline = {
+      sprintId: data.sprint.id,
+      sprintName: data.sprint.name,
+      startDate: data.sprint.start_date,
+      endDate: data.sprint.end_date,
+      lockedAt: "",
+      lockedBy: "",
+      totalSp: planTasks.reduce((sum, task) => sum + task.sp, 0),
+      totalHours: Math.round(planTasks.reduce((sum, task) => sum + (task.budgetHours ?? 0), 0) * 10) / 10,
+      tasks: planTasks
+    };
+    if (config.dryRun) {
+      console.log("DRY_RUN: Sprint Planning guide", { sprint: data.sprint.name, message, draft });
+      return { ok: true, dryRun: true, sprint: data.sprint.name, draft };
+    }
+    // Button投稿直後のクリックにも耐えるよう、messageTs未確定のsessionを先に保存する。
+    await saveSprintPlanLockSession(env.NOTIFY_CACHE, {
+      id: sessionId,
+      channel,
+      messageTs: "",
+      threadTs: threadTs ?? undefined,
+      baseline
+    });
+    const planningBlocks = [
+      ...slackSectionBlocks(message),
+      ...buildSprintPlanLockButton(sessionId)
+    ];
+    const posted = await chatPostMessage(
+      config.slackBotToken,
+      channel,
+      message,
+      planningBlocks,
+      threadTs ?? undefined
+    );
+    await saveSprintPlanLockSession(env.NOTIFY_CACHE, {
+      id: sessionId,
+      channel,
+      messageTs: posted.ts,
+      threadTs: threadTs ?? undefined,
+      baseline
+    });
+    return {
+      ok: true,
+      reason,
+      sprint: data.sprint.name,
+      checkpointCount: data.checkpoints.length,
+      threadTs,
+      commitSp: draft.commitSp,
+      commitHours: draft.commitHours,
+      capacityHours: draft.totalCapacityHours,
+      qualityCounts: draft.qualityCounts
+    };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runSprintPlanningFlow failed", err);
+    return { ok: false, error: err.message };
+  }
+}
+
+interface SprintScopeFlowState {
+  config: AppConfig;
+  channel: string;
+  threadTs: string | null;
+  diff: SprintScopeDiff;
+}
+
+async function prepareSprintScopeFlowState(env: Env): Promise<SprintScopeFlowState | null> {
+  const config = getConfig(env);
+  const channel = resolveTeamKChannelId(env);
+  const today = toJstDateString();
+  const sprints = await fetchAllSprints(config);
+  const sprint =
+    sprints.find((item) => item.start_date <= today && today <= item.end_date) ??
+    sprints.find((item) => /進行中|active|in progress/iu.test(item.status));
+  if (!sprint) return null;
+  const baseline = await getSprintPlanBaseline(env.NOTIFY_CACHE, sprint.id);
+  if (!baseline) return null;
+  const tasks = await fetchSprintDashboardTasks(config, sprint.id);
+  return {
+    config,
+    channel,
+    threadTs: await getCurrentTaskThread(env.NOTIFY_CACHE, channel).catch(() => null),
+    diff: buildSprintScopeDiff(baseline, tasks)
+  };
+}
+
+/** Lock後の新規タスクを「途中追加」にし、同じ差分は一度だけ通知する。 */
+async function runSprintScopeControlFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  try {
+    const state = await prepareSprintScopeFlowState(env);
+    if (!state) return { ok: true, skipped: true, reason: "baseline or current sprint not found" };
+    const { diff } = state;
+    if (diff.added.length === 0 && diff.removed.length === 0) {
+      return { ok: true, skipped: true, reason: "scope unchanged", sprint: diff.baseline.sprintName };
+    }
+    const previous = await getSprintScopeFingerprint(env.NOTIFY_CACHE, diff.baseline.sprintId);
+    if (previous === diff.fingerprint) {
+      return { ok: true, skipped: true, reason: "same diff already posted", sprint: diff.baseline.sprintName };
+    }
+    if (!state.config.dryRun) {
+      for (const task of diff.added) {
+        if (task.sprintClass !== "途中追加") {
+          await updateTaskSprintClass(state.config.notionToken, task.id, "途中追加");
+        }
+      }
+      if (state.config.slackBotToken && state.threadTs) {
+        await chatPostMessage(
+          state.config.slackBotToken,
+          state.channel,
+          renderSprintScopeDiff(diff),
+          undefined,
+          state.threadTs
+        );
+      }
+      await saveSprintScopeFingerprint(
+        env.NOTIFY_CACHE,
+        diff.baseline.sprintId,
+        diff.fingerprint
+      );
+    }
+    return {
+      ok: true,
+      reason,
+      sprint: diff.baseline.sprintName,
+      added: diff.added.length,
+      removed: diff.removed.length,
+      addedSp: diff.addedSp,
+      addedHours: diff.addedHours,
+      dryRun: state.config.dryRun
+    };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runSprintScopeControlFlow failed", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ── Delivery OS: 案件単価 × 工数 × FTE × 成果進捗 ────────────────────
+
+interface DeliveryFlowState {
+  config: AppConfig;
+  channel: string;
+  threadTs: string;
+  snapshot: DeliverySnapshot;
+  assessments: ProjectAssessment[];
+}
+
+async function prepareDeliveryFlowState(env: Env): Promise<DeliveryFlowState | null> {
+  const config = getConfig(env);
+  const channel = resolveTeamKChannelId(env);
+  if (!config.slackBotToken || !channel) return null;
+  const threadTs = await getCurrentTaskThread(env.NOTIFY_CACHE, channel).catch(() => null);
+  if (!threadTs) {
+    console.log("Delivery Control: today's task thread is not available; skip");
+    return null;
+  }
+  const now = new Date();
+  const snapshot = await fetchDeliveryControlSnapshot(config, now);
+  return {
+    config,
+    channel,
+    threadTs,
+    snapshot,
+    assessments: assessSnapshot(snapshot, now)
+  };
+}
+
+/** 朝のDigest直後に、担当者別の30秒更新ボタンを同じタスクスレッドへ出す。 */
+async function postDailyCheckinPrompts(
+  env: Env,
+  state: DeliveryFlowState
+): Promise<number> {
+  const dedupeKey = `daily-checkin-prompts:${state.snapshot.today}:${state.channel}`;
+  if (await env.NOTIFY_CACHE.get(dedupeKey).catch(() => null)) return 0;
+  const grouped = new Map<string, DeliverySnapshot["tasks"]>();
+  for (const task of state.snapshot.tasks) {
+    if (!isDailyUpdateTask(task.status)) continue;
+    for (const assignee of task.assignees) {
+      const list = grouped.get(assignee) ?? [];
+      if (!list.some((item) => item.id === task.id)) list.push(task);
+      grouped.set(assignee, list);
+    }
+  }
+  if (grouped.size === 0) return 0;
+  const catalog = await ensureUserCatalog(env, state.config).catch(() => []);
+  let posted = 0;
+  for (const [assignee, tasks] of grouped) {
+    const slackUserId = resolveSlackUserIdByName(catalog, assignee) ?? undefined;
+    const sessionId = crypto.randomUUID();
+    await saveDailyCheckinSession(env.NOTIFY_CACHE, {
+      id: sessionId,
+      date: state.snapshot.today,
+      channel: state.channel,
+      threadTs: state.threadTs,
+      assignee,
+      slackUserId,
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        url: task.url,
+        name: task.name,
+        status: task.status,
+        evidenceUrl: task.evidenceUrl,
+        blockerStartedAt: task.blockerStartedAt
+      }))
+    });
+    const mention = slackUserId ? `<@${slackUserId}>` : assignee;
+    const preview = tasks
+      .slice(0, 4)
+      .map((task) => `• <${task.url}|${task.name}>｜${task.status ?? "-"}`)
+      .join("\n");
+    const more = tasks.length > 4 ? `\n• ほか ${tasks.length - 4}件` : "";
+    if (!state.config.dryRun) {
+      await chatPostMessage(
+        state.config.slackBotToken!,
+        state.channel,
+        `${mention} 今日の進捗を30秒で更新できます。タスクごとに押してください。\n${preview}${more}`,
+        buildDailyCheckinButton(sessionId),
+        state.threadTs
+      );
+    }
+    posted++;
+  }
+  if (!state.config.dryRun) {
+    await env.NOTIFY_CACHE.put(dedupeKey, new Date().toISOString(), {
+      expirationTtl: 2 * 24 * 3600
+    });
+  }
+  return posted;
+}
+
+async function syncProjectDeliveryHealth(
+  state: DeliveryFlowState
+): Promise<number> {
+  if (state.config.dryRun) return 0;
+  const updates = state.assessments.filter(
+    (assessment) =>
+      assessment.severity !== "unknown" &&
+      assessment.project.currentHealth !== assessment.healthLabel
+  );
+  const results = await Promise.all(
+    updates.map((assessment) =>
+      updateProjectDeliveryHealth(
+        state.config,
+        assessment.project.id,
+        assessment.healthLabel as "🟢 Green" | "🟡 Yellow" | "🔴 Red"
+      ).catch(() => false)
+    )
+  );
+  return results.filter(Boolean).length;
+}
+
+async function postChangedDeliveryAlerts(
+  env: Env,
+  state: DeliveryFlowState,
+  force = false
+): Promise<number> {
+  const candidates: Array<{ assessment: ProjectAssessment; key: string; fingerprint: string; previous: string | null }> = [];
+  for (const assessment of state.assessments) {
+    const key = `delivery-alert:${assessment.project.id}`;
+    const fingerprint = deliveryAlertFingerprint(assessment);
+    const previous = await env.NOTIFY_CACHE.get(key).catch(() => null);
+    candidates.push({ assessment, key, fingerprint, previous });
+  }
+  const changedAlerts = candidates
+    .filter(
+      ({ assessment, fingerprint, previous }) =>
+        (assessment.severity === "yellow" || assessment.severity === "red") &&
+        (force || previous !== fingerprint)
+    )
+    .map(({ assessment }) => assessment);
+
+  if (changedAlerts.length > 0 && !state.config.dryRun) {
+    await chatPostMessage(
+      state.config.slackBotToken!,
+      state.channel,
+      renderDeliveryAlerts(changedAlerts),
+      undefined,
+      state.threadTs
+    );
+  }
+  if (!state.config.dryRun) {
+    await Promise.all(
+      candidates.map(({ key, fingerprint }) =>
+        env.NOTIFY_CACHE.put(key, fingerprint, { expirationTtl: 30 * 24 * 3600 })
+      )
+    );
+  }
+  return changedAlerts.length;
+}
+
+async function postNewExpansionGates(
+  env: Env,
+  state: DeliveryFlowState,
+  force = false
+): Promise<number> {
+  const reminders = collectExpansionReminders(state.assessments);
+  const pending: typeof reminders = [];
+  for (const reminder of reminders) {
+    const key = `delivery-expansion:${reminder.project.id}:${reminder.gate}`;
+    const existing = await env.NOTIFY_CACHE.get(key).catch(() => null);
+    if (!existing || force) pending.push(reminder);
+  }
+  if (pending.length > 0 && !state.config.dryRun) {
+    await chatPostMessage(
+      state.config.slackBotToken!,
+      state.channel,
+      renderExpansionReminders(pending),
+      undefined,
+      state.threadTs
+    );
+    await Promise.all(
+      pending.map((reminder) =>
+        env.NOTIFY_CACHE.put(
+          `delivery-expansion:${reminder.project.id}:${reminder.gate}`,
+          state.snapshot.today,
+          { expirationTtl: 120 * 24 * 3600 }
+        )
+      )
+    );
+  }
+  return pending.length;
+}
+
+/** 毎朝、当日のMM/DDタスクスレッドへ案件HealthとFTEのDigest画像を投稿する。 */
+async function runDeliveryMorningFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  try {
+    const state = await prepareDeliveryFlowState(env);
+    if (!state) return { ok: true, skipped: true, reason: "no task thread or Slack config" };
+    const dedupeKey = `delivery-digest:${state.snapshot.today}:${state.channel}`;
+    if (reason !== "manual" && (await env.NOTIFY_CACHE.get(dedupeKey))) {
+      return { ok: true, skipped: true, reason: "already posted", date: state.snapshot.today };
+    }
+    const healthUpdates = await syncProjectDeliveryHealth(state);
+    const message = renderDeliveryDigest(state.snapshot, state.assessments);
+    if (!state.config.dryRun) {
+      const height = Math.max(760, 180 + Math.ceil(Math.min(8, state.assessments.length) / 2) * 300);
+      const png = await htmlToPng(
+        env.BROWSER,
+        renderDeliveryDashboardHtml(state.snapshot, state.assessments),
+        { width: 1400, height, deviceScaleFactor: 1 }
+      ).catch(() => null);
+      if (png) {
+        await uploadImageToSlack(
+          state.config.slackBotToken!,
+          state.channel,
+          state.threadTs,
+          `delivery-control-${state.snapshot.today}.png`,
+          png,
+          message
+        );
+      } else {
+        await chatPostMessage(
+          state.config.slackBotToken!,
+          state.channel,
+          message,
+          undefined,
+          state.threadTs
+        );
+      }
+      await env.NOTIFY_CACHE.put(dedupeKey, new Date().toISOString(), {
+        expirationTtl: 2 * 24 * 3600
+      });
+    }
+    const dailyCheckinPrompts = await postDailyCheckinPrompts(env, state).catch((error) => {
+      console.error("Daily checkin prompts failed", error);
+      return 0;
+    });
+    const alerts = await postChangedDeliveryAlerts(env, state);
+    const expansionReminders = await postNewExpansionGates(env, state);
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "delivery-digest");
+    return {
+      ok: true,
+      reason,
+      projects: state.snapshot.projects.length,
+      tasks: state.snapshot.tasks.length,
+      healthUpdates,
+      alerts,
+      expansionReminders,
+      dailyCheckinPrompts,
+      dryRun: state.config.dryRun,
+      threadTs: state.threadTs
+    };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runDeliveryMorningFlow failed", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/** 18:30、未更新タスクだけを担当者単位で集約して当日スレッドへ投稿する。 */
+async function runDeliveryUpdateReminderFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  try {
+    const state = await prepareDeliveryFlowState(env);
+    if (!state) return { ok: true, skipped: true, reason: "no task thread or Slack config" };
+    const dedupeKey = `delivery-reminder:${state.snapshot.today}:${state.channel}`;
+    if (reason !== "manual" && (await env.NOTIFY_CACHE.get(dedupeKey))) {
+      return { ok: true, skipped: true, reason: "already posted", date: state.snapshot.today };
+    }
+    const gaps = collectAssigneeUpdateGaps(state.snapshot);
+    if (gaps.length === 0) {
+      return { ok: true, skipped: true, reason: "all active tasks updated" };
+    }
+    const catalog = await ensureUserCatalog(env, state.config).catch(() => []);
+    const mentions: Record<string, string> = {};
+    for (const gap of gaps) {
+      const slackId = resolveSlackUserIdByName(catalog, gap.assignee);
+      if (slackId) mentions[gap.assignee] = slackId;
+    }
+    if (!state.config.dryRun) {
+      await chatPostMessage(
+        state.config.slackBotToken!,
+        state.channel,
+        renderUpdateReminder(state.snapshot, gaps, mentions),
+        undefined,
+        state.threadTs
+      );
+      await env.NOTIFY_CACHE.put(dedupeKey, new Date().toISOString(), {
+        expirationTtl: 2 * 24 * 3600
+      });
+    }
+    const alerts = await postChangedDeliveryAlerts(env, state);
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "delivery-reminder");
+    return {
+      ok: true,
+      reason,
+      assignees: gaps.length,
+      tasks: gaps.reduce((sum, gap) => sum + gap.tasks.length, 0),
+      alerts,
+      dryRun: state.config.dryRun,
+      threadTs: state.threadTs
+    };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runDeliveryUpdateReminderFlow failed", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/** Forecast/Burn/Blockerの状態変化を確認し、Yellow/Redになった案件だけ通知する。 */
+async function runDeliveryAlertFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  try {
+    const state = await prepareDeliveryFlowState(env);
+    if (!state) return { ok: true, skipped: true, reason: "no task thread or Slack config" };
+    const healthUpdates = await syncProjectDeliveryHealth(state);
+    const alerts = await postChangedDeliveryAlerts(env, state, reason === "manual");
+    return { ok: true, reason, alerts, healthUpdates, threadTs: state.threadTs };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runDeliveryAlertFlow failed", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/** 金曜、案件Portfolioと担当者別の次週FTE需要を当日スレッドへ投稿する。 */
+async function runDeliveryPortfolioFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  try {
+    const state = await prepareDeliveryFlowState(env);
+    if (!state) return { ok: true, skipped: true, reason: "no task thread or Slack config" };
+    const dedupeKey = `delivery-portfolio:${state.snapshot.today}:${state.channel}`;
+    if (reason !== "manual" && (await env.NOTIFY_CACHE.get(dedupeKey))) {
+      return { ok: true, skipped: true, reason: "already posted", date: state.snapshot.today };
+    }
+    const capacities = calculateAssigneeCapacity(state.snapshot);
+    if (!state.config.dryRun) {
+      await chatPostMessage(
+        state.config.slackBotToken!,
+        state.channel,
+        renderPortfolioSummary(state.snapshot, state.assessments, capacities),
+        undefined,
+        state.threadTs
+      );
+      await env.NOTIFY_CACHE.put(dedupeKey, new Date().toISOString(), {
+        expirationTtl: 8 * 24 * 3600
+      });
+    }
+    return {
+      ok: true,
+      reason,
+      projects: state.snapshot.projects.length,
+      assignees: capacities.length,
+      dryRun: state.config.dryRun,
+      threadTs: state.threadTs
+    };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runDeliveryPortfolioFlow failed", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * 毎日24:00の SPRINT CONTROL。OpenAI は装飾背景だけを生成し、
+ * SP・順位・累積線・予測値は Worker が正確に描画して Slack に投稿する。
+ */
+async function runSpGamificationDashboard(
+  env: Env,
+  reason: string,
+  opts: {
+    channelId?: string;
+    threadTs?: string;
+    reportDate?: string;
+    sprintName?: string | null;
+    useAi?: boolean;
+  } = {}
+): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) {
+    return { ok: false, error: "SLACK_BOT_TOKEN is not set" };
+  }
+  const reportDate =
+    opts.reportDate ?? toJstDateString(new Date(), reason === "cron" ? -1 : 0);
+  const { data, details, taskCount } = await prepareSpGamificationDashboard(env, {
+    reportDate,
+    sprintName: opts.sprintName,
+    persistSnapshot: true
+  });
+  const background =
+    opts.useAi === false
+      ? { base64: null, model: config.openaiImageModel, error: "disabled" }
+      : await generateAiDashboardBackground(config, data);
+
+  // ダッシュボード + タスク詳細を1枚のPNGに結合してから1投稿にまとめる
+  const combinedPng = await buildCombinedDashboardPng(env.BROWSER, data, details, background);
+  if (!combinedPng) {
+    return { ok: false, error: "combined dashboard PNG render failed (BROWSER unbound?)" };
+  }
+
+  const channelName = env.S19_SCREENSHOT_CHANNEL || "team-k-古鉄";
+  const channelId =
+    opts.channelId ||
+    env.S19_SCREENSHOT_CHANNEL_ID ||
+    (await findChannelIdByName(config.slackBotToken, channelName));
+  if (!channelId) {
+    return {
+      ok: false,
+      error: `channel not found: ${channelName}（S19_SCREENSHOT_CHANNEL_ID を設定するか Bot を招待）`
+    };
+  }
+  if (reason === "cron" && !opts.threadTs) {
+    return {
+      ok: false,
+      error: "current MM/DD_タスク thread not found; SPRINT CONTROL was not posted to the channel"
+    };
+  }
+  const sprintSlug = data.sprint.name
+    .toLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+    .replace(/^-|-$/g, "");
+  const slug = sprintSlug || "sprint";
+  const messageTs = await uploadImageToSlack(
+    config.slackBotToken,
+    channelId,
+    opts.threadTs,
+    `sprint-control-${slug}-${data.reportDate}.png`,
+    combinedPng,
+    spDashboardSlackComment(data)
+  );
+  console.log(
+    `runSpGamificationDashboard: ${data.sprint.name} ${data.reportDate} ${data.current.teamCompletedSp}/${data.current.teamPlanSp}SP channel=${channelId} ai=${!!background.base64} (${reason})`
+  );
+  return {
+    ok: true,
+    channelId,
+    messageTs: messageTs ?? null,
+    detailsMessageTs: null,
+    sprint: data.sprint.name,
+    reportDate: data.reportDate,
+    taskCount,
+    teamCompletedSp: data.current.teamCompletedSp,
+    teamPlanSp: data.current.teamPlanSp,
+    teamDoneSp: data.currentDoneSp,
+    projectedDoneSp: data.projectedDoneSp,
+    projectedDoneRate: data.projectedDoneRate,
+    health: data.health,
+    weeklyProjection: data.weeklyProjection,
+    memberCount: data.members.length,
+    completedTaskRecords: details.taskCount,
+    aiThemeUsed: !!background.base64,
+    aiModel: background.model,
+    aiError: background.error ?? null,
+    usedEstimatedHistory: data.usedEstimatedHistory
+  };
+}
+
+/** 毎日24時のデイリー KPI リマインドが対象とする固定 Notion ページ（週次 KPI 表）。 */
+const KPI_PAGE_URL = "https://app.notion.com/p/aice-co-jp/KPI-3aee00135b61804887c7d658e53c6701";
+
+const JST_OFFSET_MS = 9 * 3600 * 1000;
+
+type DailyKpiTarget = {
+  url: string;
+  source: "explicit_url" | "env_override" | "kpi_page";
+};
+
+export function resolveDailyKpiTarget(env: Bindings, opts: { explicitUrl?: string | null } = {}): DailyKpiTarget {
+  if (opts.explicitUrl) return { url: opts.explicitUrl, source: "explicit_url" };
+  // env に明示URLが設定されている場合のみ固定KPIページより優先する（開発環境等での差し替え用）
+  if (env.NOTION_S19_URL) return { url: env.NOTION_S19_URL, source: "env_override" };
+  return { url: KPI_PAGE_URL, source: "kpi_page" };
+}
+
+/** JST の現在時刻の 月/日 を返す。 */
+export function jstTodayMD(nowMs = Date.now()): { m: number; d: number } {
+  const j = new Date(nowMs + JST_OFFSET_MS);
+  return { m: j.getUTCMonth() + 1, d: j.getUTCDate() };
+}
+
+/**
+ * ScrumTable の各行から KpiRowContext（担当者+KPIテキスト+推論済みcadence+セル配列）を構築する。
+ * 同一(担当者,KPIテキスト)の重複行はスキップ。KPIテキスト列が見つからない表は空配列を返す。
+ */
+export async function buildKpiRowContexts(
+  config: AppConfig,
+  kv: KVNamespace,
+  table: ScrumTable
+): Promise<KpiRowContext[]> {
+  const kpiColIdx = kpiTextColumnIndex(table);
+  if (kpiColIdx < 0) return [];
+  const catColIdx = skillCategoryColumnIndex(table);
+  const seen = new Set<string>();
+  const contexts: KpiRowContext[] = [];
+  for (const r of table.rows) {
+    if (!r.member) continue;
+    const kpiText = r.cells[kpiColIdx]?.trim();
+    if (!kpiText) continue;
+    const dedupeKey = `${r.member}::${kpiText}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    const skillCategory = catColIdx >= 0 ? r.cells[catColIdx]?.trim() || null : null;
+    const { itemKey, cadence } = await getOrInferCadence(config, kv, r.member, kpiText, skillCategory);
+    contexts.push({ member: r.member, itemKey, kpiText, cadence, cells: r.cells });
+  }
+  return contexts;
+}
+
+/** JST の前日（昨日）の月/日。24:00(=JST 0時)投稿時点では「終わった前日」になる。 */
+function jstYesterdayMD(nowMs = Date.now()): { m: number; d: number } {
+  const j = new Date(nowMs + JST_OFFSET_MS - 24 * 3600 * 1000);
+  return { m: j.getUTCMonth() + 1, d: j.getUTCDate() };
+}
+
+/** 表の担当者名(例:古鉄) → Slack ユーザーID。部分一致で解決。 */
+function resolveSlackId(
+  members: Array<{ name: string; slackUserId?: string }>,
+  config: ReturnType<typeof getConfig>,
+  name: string
+): string | undefined {
+  const n = name.trim();
+  if (!n) return undefined;
+  for (const m of members) {
+    if (m.slackUserId && (m.name === n || m.name.includes(n) || n.includes(m.name))) return m.slackUserId;
+  }
+  for (const [k, v] of Object.entries(config.memberSlackMap)) {
+    if (k === n || k.includes(n) || n.includes(k)) return v;
+  }
+  return undefined;
+}
+
+// 旧デイリーKPI投稿+10分おきリマインド(runS19DailyPost/runS19ReminderTick)は
+// KPI実行担保エンジン（runKpiMorningPost/runKpiEveningCheck/runKpiBoardPost、下記）に置き換え済み。
+
+/**
+ * 特定のKPI項目に対するメンバーの履行率を返す（0.0〜1.0）。
+ * 直近5件のコミットメントのうち fulfilled の割合。
+ * 履歴が2件未満のときは -1（判断不可）を返す。
+ */
+function computeItemComplianceRate(memory: KpiMemberMemory, itemKey: string): number {
+  const all = memory.commitments.filter((c) => c.itemKey === itemKey && c.fulfilled !== "pending");
+  if (all.length < 2) return -1;
+  const recent = all.slice(-5);
+  return recent.filter((c) => c.fulfilled === "fulfilled").length / recent.length;
+}
+
+/**
+ * リスク項目の深刻度から「必ず送る」かどうかを返す。
+ * pace_danger / not_started は履行率に関わらず常に送信対象。
+ */
+function isSevereRisk(riskKind: string): boolean {
+  return riskKind === "pace_danger" || riskKind === "not_started";
+}
+
+/**
+ * 毎日08:40：team-k-古鉄 に「MM/DD_KPI」親メッセージを投稿する。着手リスクのあるKPI
+ * （週内回数のペースが間に合わない等）を持つメンバーだけをスレッド内でメンションし、
+ * 「いつやりますか」を尋ねる。KpiThreadState をKVに保存し、以降このスレッドへの返信は
+ * handleKpiReply がリアルタイムで詰める（納得いく回答が来るまで）。
+ */
+async function runKpiMorningPost(
+  env: Env,
+  reason: string,
+  opts?: { channelId?: string; overrideDate?: { m: number; d: number } }
+): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+
+  const channelId = opts?.channelId || resolveTeamKChannelId(env);
+  const target = resolveDailyKpiTarget(env);
+  const now = new Date();
+  const todayMD = opts?.overrideDate || jstTodayMD(now.getTime());
+  const today = toJstDateString(now);
+  const dateLabel = today.slice(5).replace("-", "/"); // "MM/DD"
+
+  const table = await fetchScrumTable(config, target.url, { month: todayMD.m, day: todayMD.d }).catch(() => null);
+  if (!table) return { ok: false, error: "KPI table not found for today" };
+
+  const rows = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+  const rawRiskItems = computeKpiRiskAssessment(rows, table, { month: todayMD.m, day: todayMD.d }, "morning");
+
+  // 履行率が高い（自走できる）人のKPI項目はスキップ。
+  // 直近5件の約束のうち 80% 以上を守っており、かつリスクが軽度の場合は朝メッセージ不要。
+  const riskItems: typeof rawRiskItems = [];
+  for (const item of rawRiskItems) {
+    if (!isSevereRisk(item.riskKind)) {
+      const memory = await getKpiMemory(env.NOTIFY_CACHE, item.member);
+      const rate = computeItemComplianceRate(memory, item.itemKey);
+      if (rate >= 0.8) {
+        console.log(`runKpiMorningPost: skip self-managing "${item.member}" / "${item.kpiText}" (rate=${rate.toFixed(2)})`);
+        continue;
+      }
+    }
+    riskItems.push(item);
+  }
+
+  const parent = await chatPostMessage(config.slackBotToken, channelId, `${dateLabel}_KPI`).catch(() => null);
+  if (!parent?.ts) return { ok: false, error: "failed to post parent message" };
+  const parentTs = parent.ts;
+  await saveTodayKpiThreadRef(env.NOTIFY_CACHE, channelId, { parentTs, date: today }).catch(() => {});
+
+  // Notion KPI表へのリンクを最初の返信として投稿
+  await chatPostMessage(
+    config.slackBotToken,
+    channelId,
+    `📊 <${target.url}|Notion KPI表を開く>`,
+    undefined,
+    parentTs
+  ).catch(() => {});
+
+  // リンクの直後に、その週のKPI表スクショを同スレッドへ投稿する。
+  // スクショ失敗（セッション切れ・ブラウザ未バインド等）でも朝投稿自体は継続する。
+  try {
+    const session = await getNotionSession(env.NOTIFY_CACHE);
+    if (session) {
+      const todayCol = table.dateColumns.find((c) => c.month === todayMD.m && c.day === todayMD.d);
+      const shotLabel = todayCol?.label ?? `${todayMD.m}/${todayMD.d}`;
+      const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
+      const png = await captureNotionPage(env.BROWSER, session, target.url, avatarMap, true, shotLabel);
+      if (png) {
+        await uploadImageToSlack(config.slackBotToken, channelId, parentTs, `kpi-week-${today}.png`, png).catch(() => {});
+      } else {
+        console.warn("runKpiMorningPost: KPI screenshot failed (session expired / browser unbound?)");
+      }
+    } else {
+      console.log("runKpiMorningPost: no Notion session in KV (notion:session) — skipping KPI screenshot");
+    }
+  } catch (err) {
+    console.warn(`runKpiMorningPost: KPI screenshot error: ${(err as Error).message}`);
+  }
+
+  if (riskItems.length === 0) {
+    await chatPostMessage(
+      config.slackBotToken,
+      channelId,
+      "本日、着手リスクのあるKPIはありません（このペースなら間に合います）。今日も一日頑張りましょう！",
+      undefined,
+      parentTs
+    ).catch(() => {});
+    console.log(`runKpiMorningPost: posted to ${channelId} thread=${parentTs} risk=0 (${reason})`);
+    return { ok: true, channelId, parentTs, riskCount: 0 };
+  }
+
+  const byMember = new Map<string, typeof riskItems>();
+  for (const item of riskItems) {
+    const arr = byMember.get(item.member) ?? [];
+    arr.push(item);
+    byMember.set(item.member, arr);
+  }
+
+  const members = await fetchMembers(config).catch(() => []);
+  const incidents: Record<string, KpiIncident> = {};
+  let mentioned = 0;
+
+  for (const [member, items] of byMember) {
+    const slackId = resolveSlackId(members, config, member);
+    const memory = await getKpiMemory(env.NOTIFY_CACHE, member);
+    const history = items.map((i) => ({ kpiText: i.kpiText, ...recentForItem(memory, i.itemKey) }));
+    const nudgeItems = items.map((i) => ({ itemKey: i.itemKey, kpiText: i.kpiText, triggerKind: i.riskKind, detail: i.detail }));
+    const nudge = await generateKpiNudge(config, { member, items: nudgeItems, history, timeSlot: "morning" }).catch(() => null);
+    const mentionPrefix = slackId ? `<@${slackId}> ` : `${member} `;
+    const nudgeBody = nudge ?? `${items.map((i) => `「${i.kpiText}」`).join("、")} について、今日中の見込みを教えてください。`;
+    await chatPostMessage(config.slackBotToken, channelId, `${mentionPrefix}${nudgeBody}`, undefined, parentTs).catch(() => {});
+    mentioned++;
+
+    if (slackId) {
+      incidents[slackId] = {
+        member,
+        items: items.map((i) => ({ itemKey: i.itemKey, kpiText: i.kpiText, triggerKind: i.riskKind, detail: i.detail })),
+        openedAt: new Date().toISOString(),
+        pressCount: 0,
+        lastPromptAt: new Date().toISOString(),
+        resolved: false,
+        conversation: appendConversationTurn(undefined, "bot", nudgeBody)
+      };
+    } else {
+      console.warn(`runKpiMorningPost: no Slack ID for member "${member}", incident not armed (no reply tracking)`);
+    }
+  }
+
+  if (Object.keys(incidents).length > 0) {
+    await saveKpiThreadState(env.NOTIFY_CACHE, channelId, parentTs, {
+      channel: channelId,
+      parentTs,
+      date: today,
+      incidents
+    }).catch(() => {});
+  }
+
+  console.log(`runKpiMorningPost: posted to ${channelId} thread=${parentTs} risk=${riskItems.length} mentioned=${mentioned} (${reason})`);
+  return { ok: true, channelId, parentTs, riskCount: riskItems.length, mentioned };
+}
+
+/**
+ * 18:00/21:00：当日のKPIスレッド（08:40に開いたもの）で、リスクの残っているKPIをエスカレーションする。
+ * 既存インシデントがあればitemを統合して再エスカレーション、無ければ新規に開く。
+ * 「まだ期日が来ていない約束」がある item は今回は静観し、期日を過ぎた約束は実際のセルと
+ * 突き合わせて fulfilled/broken を確定させる（次回以降の詰めの材料として記憶に残す）。
+ */
+async function runKpiEveningCheck(
+  env: Env,
+  reason: string,
+  slotLabel: "1800" | "2100",
+  opts?: { channelId?: string; overrideDate?: { m: number; d: number } }
+): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+
+  const channelId = opts?.channelId || resolveTeamKChannelId(env);
+  const target = resolveDailyKpiTarget(env);
+  const now = new Date();
+  const todayMD = opts?.overrideDate || jstTodayMD(now.getTime());
+  // today(YYYY-MM-DD)は todayMD と必ず一致させる（commitment期日比較に使うため、overrideDate指定時のズレを防ぐ）
+  const jstYear = new Date(now.getTime() + JST_OFFSET_MS).getUTCFullYear();
+  const today = `${jstYear}-${String(todayMD.m).padStart(2, "0")}-${String(todayMD.d).padStart(2, "0")}`;
+
+  const table = await fetchScrumTable(config, target.url, { month: todayMD.m, day: todayMD.d }).catch(() => null);
+  if (!table) return { ok: false, error: "KPI table not found for today" };
+
+  const rows = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+  const allRisk = computeKpiRiskAssessment(rows, table, { month: todayMD.m, day: todayMD.d }, "evening");
+  const todayColPos = table.dateColumns.findIndex((c) => c.month === todayMD.m && c.day === todayMD.d);
+
+  const membersInRisk = [...new Set(allRisk.map((r) => r.member))];
+  const memoryByMember = new Map<string, KpiMemberMemory>();
+  for (const m of membersInRisk) memoryByMember.set(m, await getKpiMemory(env.NOTIFY_CACHE, m));
+
+  // 期日を過ぎた約束を実際のセルと突き合わせて確定させる（未来日の約束はまだ判定しない）
+  const outcomes = resolvePendingCommitments(rows, table, memoryByMember, todayColPos);
+  for (const o of outcomes) {
+    await markCommitmentOutcome(env.NOTIFY_CACHE, o.member, o.itemKey, o.committedDate, o.outcome).catch(() => {});
+  }
+  if (outcomes.length > 0) {
+    for (const m of membersInRisk) memoryByMember.set(m, await getKpiMemory(env.NOTIFY_CACHE, m));
+  }
+
+  // 「まだ期日が来ていない約束」がある item は今回は静観する（約束の期日まで待つ）
+  const suppressed = new Set<string>();
+  for (const [member, memory] of memoryByMember) {
+    for (const c of memory.commitments) {
+      if (c.fulfilled === "pending" && c.committedDate >= today) suppressed.add(`${member}::${c.itemKey}`);
+    }
+  }
+  const riskItems = allRisk.filter((r) => !suppressed.has(`${r.member}::${r.itemKey}`));
+
+  if (riskItems.length === 0) {
+    console.log(`runKpiEveningCheck(${slotLabel}): no risk to escalate (suppressed=${suppressed.size}, resolvedCommitments=${outcomes.length})`);
+    return { ok: true, channelId, riskCount: 0, suppressed: suppressed.size, resolvedCommitments: outcomes.length };
+  }
+
+  let threadRef = await getTodayKpiThreadRef(env.NOTIFY_CACHE, channelId);
+  let parentTs: string;
+  if (threadRef) {
+    parentTs = threadRef.parentTs;
+  } else {
+    // 朝の投稿が無かった場合のフォールバック（本来は08:40に必ず開いているはず）
+    const dateLabel = today.slice(5).replace("-", "/");
+    const parent = await chatPostMessage(config.slackBotToken, channelId, `${dateLabel}_KPI`).catch(() => null);
+    if (!parent?.ts) return { ok: false, error: "failed to post parent message" };
+    parentTs = parent.ts;
+    await saveTodayKpiThreadRef(env.NOTIFY_CACHE, channelId, { parentTs, date: today }).catch(() => {});
+  }
+
+  const kpiState: KpiThreadState =
+    (await getKpiThreadState(env.NOTIFY_CACHE, channelId, parentTs)) ||
+    { channel: channelId, parentTs, date: today, incidents: {} };
+
+  const byMember = new Map<string, typeof riskItems>();
+  for (const item of riskItems) {
+    const arr = byMember.get(item.member) ?? [];
+    arr.push(item);
+    byMember.set(item.member, arr);
+  }
+
+  const members = await fetchMembers(config).catch(() => []);
+  const updatedIncidents: Record<string, KpiIncident> = { ...kpiState.incidents };
+  let escalated = 0;
+
+  for (const [member, items] of byMember) {
+    const slackId = resolveSlackId(members, config, member);
+    if (!slackId) {
+      console.warn(`runKpiEveningCheck: no Slack ID for member "${member}", skipping`);
+      continue;
+    }
+    const existing = updatedIncidents[slackId];
+    const memory = memoryByMember.get(member) ?? (await getKpiMemory(env.NOTIFY_CACHE, member));
+    const history = items.map((i) => ({ kpiText: i.kpiText, ...recentForItem(memory, i.itemKey) }));
+    const nudgeItems = items.map((i) => ({ itemKey: i.itemKey, kpiText: i.kpiText, triggerKind: i.riskKind, detail: i.detail }));
+    const hasReplied = (existing?.conversation ?? []).some((t) => t.role === "member");
+    const nudge = await generateKpiNudge(config, {
+      member,
+      items: nudgeItems,
+      history,
+      timeSlot: "evening",
+      conversation: existing?.conversation,
+      hasReplied
+    }).catch(() => null);
+    const nudgeBody = nudge ?? `${items.map((i) => `「${i.kpiText}」`).join("、")} がまだ未達成です。今日中の見込みを教えてください。`;
+    await chatPostMessage(config.slackBotToken, channelId, `<@${slackId}> ${nudgeBody}`, undefined, parentTs).catch(() => {});
+    escalated++;
+
+    const mergedItems = new Map<string, KpiIncidentItem>();
+    if (existing) for (const it of existing.items) mergedItems.set(it.itemKey, it);
+    for (const i of items) {
+      mergedItems.set(i.itemKey, { itemKey: i.itemKey, kpiText: i.kpiText, triggerKind: i.riskKind, detail: i.detail });
+    }
+
+    updatedIncidents[slackId] = {
+      member,
+      items: [...mergedItems.values()],
+      openedAt: existing?.openedAt ?? new Date().toISOString(),
+      pressCount: (existing?.pressCount ?? 0) + 1,
+      lastPromptAt: new Date().toISOString(),
+      resolved: false,
+      conversation: appendConversationTurn(existing?.conversation, "bot", nudgeBody)
+    };
+  }
+
+  await saveKpiThreadState(env.NOTIFY_CACHE, channelId, parentTs, {
+    channel: channelId,
+    parentTs,
+    date: today,
+    incidents: updatedIncidents
+  }).catch(() => {});
+
+  console.log(
+    `runKpiEveningCheck(${slotLabel}): posted to ${channelId} thread=${parentTs} risk=${riskItems.length} suppressed=${suppressed.size} escalated=${escalated} (${reason})`
+  );
+  return { ok: true, channelId, parentTs, riskCount: riskItems.length, suppressed: suppressed.size, escalated };
+}
+
+/**
+ * 13:00 JST — 朝ナッジを送ったのにまだ返事をしていないメンバーへの昼フォローアップ。
+ * Notion表の再チェックは行わず、KVのスレッド状態だけを見て未返信者を特定してリマインドする。
+ */
+async function runKpiMiddayFollowup(
+  env: Env,
+  reason: string,
+  opts?: { channelId?: string }
+): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+
+  const channelId = opts?.channelId || resolveTeamKChannelId(env);
+  const threadRef = await getTodayKpiThreadRef(env.NOTIFY_CACHE, channelId).catch(() => null);
+  if (!threadRef) return { ok: true, skipped: true, reason: "no kpi thread for today" };
+
+  const kpiState = await getKpiThreadState(env.NOTIFY_CACHE, channelId, threadRef.parentTs).catch(() => null);
+  if (!kpiState) return { ok: true, skipped: true, reason: "no kpi thread state" };
+
+  const members = await fetchMembers(config).catch(() => []);
+  let followed = 0;
+
+  const REMIND_INTERVAL_MS = 15 * 60 * 1000; // 15分
+
+  for (const [slackId, incident] of Object.entries(kpiState.incidents)) {
+    if (incident.resolved || incident.items.length === 0) continue;
+
+    const hasReplied = (incident.conversation ?? []).some((t) => t.role === "member");
+    if (hasReplied) continue; // 既に返事あり → スキップ
+
+    // 前回送信から15分未満ならスキップ（連続リマインド間隔を守る）
+    if (incident.lastPromptAt) {
+      const elapsed = Date.now() - new Date(incident.lastPromptAt).getTime();
+      if (elapsed < REMIND_INTERVAL_MS) continue;
+    }
+
+    const memory = await getKpiMemory(env.NOTIFY_CACHE, incident.member);
+    const history = incident.items.map((i) => ({ kpiText: i.kpiText, ...recentForItem(memory, i.itemKey) }));
+    const nudge = await generateKpiNudge(config, {
+      member: incident.member,
+      items: incident.items.map((i) => ({ itemKey: i.itemKey, kpiText: i.kpiText, triggerKind: i.triggerKind, detail: "" })),
+      history,
+      timeSlot: "midday",
+      conversation: incident.conversation,
+      hasReplied: false
+    }).catch(() => null);
+
+    const body = nudge ?? `${incident.items.map((i) => `「${i.kpiText}」`).join("、")} について、まだご返事いただいていません。一言でよいので今日の状況を教えてください。`;
+    await chatPostMessage(config.slackBotToken, channelId, `<@${slackId}> ${body}`, undefined, threadRef.parentTs).catch(() => {});
+
+    const updatedIncident = {
+      ...incident,
+      pressCount: incident.pressCount + 1,
+      lastPromptAt: new Date().toISOString(),
+      conversation: appendConversationTurn(incident.conversation, "bot", body)
+    };
+    await saveKpiThreadState(env.NOTIFY_CACHE, channelId, threadRef.parentTs, {
+      ...kpiState,
+      incidents: { ...kpiState.incidents, [slackId]: updatedIncident }
+    }).catch(() => {});
+
+    followed++;
+  }
+
+  console.log(`runKpiMiddayFollowup: channel=${channelId} followed=${followed} (${reason})`);
+  return { ok: true, channelId, followed };
+}
+
+/**
+ * 25:00(=翌01:00)：当日のKPI表をスクショし、当日のKPIスレッドに詳細（表+各メンバーの実況+
+ * ストリーク警告+称賛）を返信する。さらに同じスクショをチャンネル直下にも投稿し、
+ * 「AA：〇〇〇〇〇〇」形式のコンパクトな週間記号一覧+警告+称賛をスレッドを開かなくても見えるようにする。
+ */
+async function runKpiBoardPost(
+  env: Env,
+  reason: string,
+  opts?: { channelId?: string; overrideDate?: { m: number; d: number } }
+): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+
+  const channelId = opts?.channelId || resolveTeamKChannelId(env);
+  const target = resolveDailyKpiTarget(env);
+  const now = new Date();
+  const todayMD = opts?.overrideDate || jstTodayMD(now.getTime());
+  const today = toJstDateString(now);
+
+  const table = await fetchScrumTable(config, target.url, { month: todayMD.m, day: todayMD.d }).catch(() => null);
+  if (!table) return { ok: false, error: "KPI table not found for today" };
+  const todayCol = table.dateColumns.find((c) => c.month === todayMD.m && c.day === todayMD.d);
+  const dateLabel = todayCol?.label ?? `${todayMD.m}/${todayMD.d}`;
+
+  // 直近の別週テーブル（あれば）をストリーク照合用に追加取得。ページに1表しか無ければ同じ表が返るので、
+  // tableIdが同一なら「別週なし」として扱う。
+  const prevJst = new Date(now.getTime() - 7 * 24 * 3600 * 1000 + JST_OFFSET_MS);
+  const prevMD = { month: prevJst.getUTCMonth() + 1, day: prevJst.getUTCDate() };
+  const prevTable = await fetchScrumTable(config, target.url, prevMD).catch(() => null);
+  const tablesForStreak = prevTable && prevTable.tableId !== table.tableId ? [table, prevTable] : [table];
+
+  const rows = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+  const { warnings, praise } = computeStreaksAndPraise(tablesForStreak, rows);
+
+  const membersInTableOrder: string[] = [];
+  const seenMembers = new Set<string>();
+  for (const r of table.rows) {
+    if (r.member && !seenMembers.has(r.member)) {
+      seenMembers.add(r.member);
+      membersInTableOrder.push(r.member);
+    }
+  }
+  const perMemberSymbols = membersInTableOrder.map((member) => ({
+    member,
+    symbols: formatMemberDaySymbols(
+      rows.filter((r) => r.member === member),
+      table.dateColumns,
+      todayCol?.index
+    )
+  })).filter((s) => s.symbols);
+
+  const narration = await buildWeeklyBoardNarration(config, { perMemberSymbols, warnings, praise, dateLabel }).catch(() => null);
+
+  const session = await getNotionSession(env.NOTIFY_CACHE);
+  if (!session) return { ok: false, error: "no notion session (notion:session 未保存)" };
+  const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
+  const png = await captureNotionPage(env.BROWSER, session, target.url, avatarMap, true, dateLabel);
+  if (!png) return { ok: false, error: "screenshot failed (session expired / browser unbound?)" };
+
+  const compactBlock = perMemberSymbols.map((s) => `${s.member}：${s.symbols}`).join("\n");
+  const warningLines = warnings.map((w) => `⚠️ ${w.member}さん「${w.kpiText}」${w.streakLen}日連続未達成`);
+  const praiseLines = praise.map((p) => `🎉 ${p.member}さん 達成率${Math.round(p.rate * 100)}%（${p.achievedCount}/${p.totalCount}）`);
+
+  // チャンネル直下にスクショ+コンパクト一覧を投稿（スレッド返信はしない）
+  const channelCaption = [
+    `📊 *デイリー KPI 週間サマリー*（${dateLabel}時点）`,
+    compactBlock || null,
+    warningLines.length ? warningLines.join("\n") : null,
+    praiseLines.length ? praiseLines.join("\n") : null,
+    narration
+  ].filter(Boolean).join("\n\n");
+  await uploadImageToSlack(config.slackBotToken, channelId, undefined, `kpi-board-${today}.png`, png, channelCaption).catch(() => {});
+
+  console.log(`runKpiBoardPost: posted to ${channelId} (channel-only) warnings=${warnings.length} praise=${praise.length} (${reason})`);
+  return { ok: true, channelId, warnings: warnings.length, praise: praise.length, perMemberSymbols };
+}
+
+/**
+ * 24:00頃〜08:20 JST、10分おき：当日(08:40スレッドを開いた日)のKPI表がまだ未記入の担当者がいれば
+ * そのスレッドで10分おきにリマインドする。全員記入済みになったら、その週のKPI表のスクショを
+ * スレッドに投稿して完了とする（以後は同じ日について再投稿しない）。
+ */
+async function runKpiMidnightFillCheck(env: Env, reason: string): Promise<Record<string, unknown>> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return { ok: true, skipped: true, reason: "no bot token" };
+
+  const channelId = resolveTeamKChannelId(env);
+  const threadRef = await getTodayKpiThreadRef(env.NOTIFY_CACHE, channelId).catch(() => null);
+  if (!threadRef) return { ok: true, skipped: true, reason: "no kpi thread for today" };
+
+  const doneKey = `kpi:midnight-done:${channelId}:${threadRef.date}`;
+  if (await env.NOTIFY_CACHE.get(doneKey)) return { ok: true, skipped: true, reason: "already completed" };
+
+  const [ym, mm, dd] = threadRef.date.split("-").map((v) => parseInt(v, 10));
+  const target = resolveDailyKpiTarget(env);
+  const table = await fetchScrumTable(config, target.url, { month: mm, day: dd }).catch(() => null);
+  if (!table) return { ok: false, error: "KPI table not found" };
+  const colIndex = dateColumnIndex(table, mm, dd);
+  if (colIndex == null) return { ok: false, error: "date column not found" };
+
+  const emptyMembers = emptyMembersForColumn(table, colIndex);
+
+  if (emptyMembers.length === 0) {
+    const session = await getNotionSession(env.NOTIFY_CACHE);
+    if (!session) return { ok: false, error: "no notion session (notion:session 未保存)" };
+    const shotLabel = table.dateColumns.find((c) => c.index === colIndex)?.label ?? `${mm}/${dd}`;
+    const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
+    const png = await captureNotionPage(env.BROWSER, session, target.url, avatarMap, true, shotLabel);
+    if (!png) return { ok: false, error: "screenshot failed (session expired / browser unbound?)" };
+
+    await chatPostMessage(
+      config.slackBotToken,
+      channelId,
+      "✅ 全員のKPI記載が完了しました！その週のKPI表です。",
+      undefined,
+      threadRef.parentTs
+    ).catch(() => {});
+    await uploadImageToSlack(
+      config.slackBotToken,
+      channelId,
+      threadRef.parentTs,
+      `kpi-week-filled-${threadRef.date}.png`,
+      png
+    ).catch(() => {});
+    await env.NOTIFY_CACHE.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 }).catch(() => {});
+    console.log(`runKpiMidnightFillCheck: all filled, posted screenshot to ${channelId} (${reason})`);
+    return { ok: true, allFilled: true, channelId, date: threadRef.date };
+  }
+
+  // 10分おきのリマインド間隔をKVでゲート（cronの粒度が10分なので9分でも十分だが、余裕を持って9分に設定）。
+  const gateKey = `kpi:midnight-remind:${channelId}:${threadRef.date}`;
+  const lastAt = await env.NOTIFY_CACHE.get(gateKey);
+  if (lastAt && Date.now() - parseInt(lastAt, 10) < 9 * 60 * 1000) {
+    return { ok: true, skipped: true, reason: "throttled", remaining: emptyMembers };
+  }
+
+  const members = await fetchMembers(config).catch(() => []);
+  const mentions = emptyMembers.map((m) => {
+    const slackId = resolveSlackId(members, config, m);
+    return slackId ? `<@${slackId}>` : m;
+  });
+  await chatPostMessage(
+    config.slackBotToken,
+    channelId,
+    `⏰ ${mentions.join(" ")} 本日のKPI表への記載がまだ確認できていません。記載をお願いします。`,
+    undefined,
+    threadRef.parentTs
+  ).catch(() => {});
+  await env.NOTIFY_CACHE.put(gateKey, String(Date.now()), { expirationTtl: 3600 }).catch(() => {});
+
+  console.log(`runKpiMidnightFillCheck: reminded ${emptyMembers.length} member(s) in ${channelId} (${reason})`);
+  return { ok: true, remindedCount: emptyMembers.length, remaining: emptyMembers };
 }
 
 // ── Notion Webhook 受信ハンドラ ─────────────────────────────────────────────
@@ -1544,14 +3034,6 @@ async function handleNotionWebhook(
  *   doing(20%) → 0.2, doing(60%)M2✅ → 0.6, 完了/Done → 1.0
  *   Backlog/Ready/ペンディング/中止/他者ボール 等 → 0（進捗SPに寄与しない）
  */
-function statusProgressRate(status: string | null): number {
-  if (!status) return 0;
-  if (status.includes("完了") || /\bdone\b/i.test(status)) return 1.0;
-  const m = status.match(/(\d+)\s*%/);
-  if (m) return Math.min(100, parseInt(m[1], 10)) / 100;
-  return 0;
-}
-
 /** page_id のスナップショットと現在値を比較し、変化があれば当日スレッドに通知する。 */
 async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   const snapshot = await getTaskSnapshot(env.NOTIFY_CACHE, pageId);
@@ -1561,6 +3043,16 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   }
   const config = getConfig(env);
   if (!config.slackBotToken) return;
+
+  // 当日のタスクスレッドがあれば優先、なければスナップショットの作成元スレッドにフォールバック
+  const teamKChannel = resolveTeamKChannelId(env);
+  const currentThread = await getCurrentTaskThread(env.NOTIFY_CACHE, teamKChannel).catch(() => null);
+  const taskChannel = currentThread ? teamKChannel : snapshot.channel;
+  const taskThread = currentThread ?? snapshot.threadTs;
+  if (!taskThread) {
+    console.log(`Notion webhook: no task thread for page ${pageId} — skip`);
+    return;
+  }
 
   const current = await fetchTaskPropertiesById(config, pageId);
   if (!current) {
@@ -1580,6 +3072,16 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
     statusChanged = true;
     // ステータスは N% 表示（doing(60%) → 60%）
     changes.push(`ステータス：${simplifyStatus(snapshot.status)} → ${simplifyStatus(current.status)}`);
+    if (isCompletedStatus(current.status) && !isCompletedStatus(snapshot.status)) {
+      // 完了日プロパティが空でも、webhook でステータス変更を検知した瞬間の時刻を正確な完了記録として残す。
+      await recordTaskCompletion(env.NOTIFY_CACHE, pageId, {
+        name: current.name || snapshot.taskName,
+        sp: current.sp ?? snapshot.sp ?? null,
+        assignees: current.assignees,
+        project: current.project,
+        completedAt: new Date().toISOString()
+      }).catch((err) => console.warn(`recordTaskCompletion failed: ${(err as Error).message}`));
+    }
     // 進捗SP: 「基準率(計上済みの最高率)より増えたとき」だけ表示する。
     //   例) 60%→他者ボール→完了 の差分は +40%（+100%ではない）。
     //   doing→Pending/Backlog/中止/他者ボール 等は一時停止なので進捗ダウンは出さない。
@@ -1599,7 +3101,13 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
     changes.push(`担当者変更：${prevA || "なし"} → ${curA || "なし"}`);
   }
   if ((snapshot.due ?? null) !== (current.due ?? null)) {
-    changes.push(`期限変更：${snapshot.due ?? "なし"} → ${current.due ?? "なし"}`);
+    const WDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+    const fmtDue = (d: string | null | undefined) => {
+      if (!d) return "なし";
+      const dt = new Date(`${d}T00:00:00+09:00`);
+      return `${dt.getMonth() + 1}/${dt.getDate()}(${WDAYS[dt.getDay()]})`;
+    };
+    changes.push(`期限変更：${fmtDue(snapshot.due)} → ${fmtDue(current.due)}`);
   }
   if ((snapshot.sp ?? null) !== (current.sp ?? null)) {
     changes.push(`SP変更：${snapshot.sp ?? "なし"} → ${current.sp ?? "なし"}`);
@@ -1620,19 +3128,18 @@ async function handleNotionChange(env: Env, pageId: string): Promise<void> {
   const assigneeLabel = current.assignees.length > 0 ? current.assignees.join("、") : "担当者未設定";
   // アイコン: ステータス変更時は進捗の増減で矢印、それ以外は🔄
   const icon = statusChanged ? (progressArrow || ":arrow_right:") : ":arrows_counterclockwise:";
-  const title = statusChanged
-    ? `${icon}  ${assigneeLabel}のタスク「${taskName}」のステータスが更新されました。`
-    : `${icon}  ${assigneeLabel}のタスク「${taskName}」が更新されました。`;
-  // 変更点は rich_text_list でネイティブ箇条書き描画（text はフォールバック/通知プレビュー用）
-  const msg = `${title}\n${changes.map((c) => `• ${c}`).join("\n")}`;
-  const blocks = bulletListBlocks(title, changes);
-  await chatPostMessage(config.slackBotToken, snapshot.channel, msg, blocks, snapshot.threadTs);
-  console.log(`Notion webhook: notified thread ${snapshot.threadTs} — ${changes.join(" / ")}`);
+  // タイトル行 + rich_text_list で箇条書き
+  const title = `${icon} タスク更新`;
+  const bullets = [`更新「${taskName}」（担当：${assigneeLabel}）`, ...changes];
+  const msg = `${title}\n${bullets.join("\n")}`;
+  const blocks = bulletListBlocks(title, bullets) as Record<string, unknown>[];
+  await chatPostMessage(config.slackBotToken, taskChannel, msg, blocks, taskThread);
+  console.log(`Notion webhook: notified Team K thread ${taskThread} — ${changes.join(" / ")}`);
 
   // スナップショットを現在値で更新（同じ変更で二重通知しないため）
   await saveTaskSnapshot(env.NOTIFY_CACHE, pageId, {
-    threadTs: snapshot.threadTs,
-    channel: snapshot.channel,
+    threadTs: taskThread,
+    channel: taskChannel,
     taskName: current.name || snapshot.taskName,
     status: current.status,
     assignees: current.assignees,
@@ -2021,17 +3528,45 @@ async function runProgressSpSnapshot(
     config = getConfig(env);
     const now = new Date();
     const today = toJstDateString(now);
-    const summary = await fetchCurrentSprintTasksSummary(config, now);
 
-    const progressSp = summary.sprint_metrics?.progress_sp ?? null;
-    const snapshotKey = `progress-sp-5am:${summary.sprint.id}:${today}`;
+    // タスクDBからスプリントタスクを取得し、進捗率(doing(60%)=0.6)でSPを集計する
+    // groupTasksByAssignee は多担当タスクを複数グループに入れるため、IDで重複排除してから集計
+    const fullSummary = await fetchCurrentSprintTasksSummary(config, now, { includeCompleted: true });
+    const uniqueTasks = [
+      ...new Map(
+        fullSummary.assignees.flatMap((a) => a.tasks).map((t) => [t.id, t])
+      ).values()
+    ];
+    const progressSp = uniqueTasks.reduce(
+      (sum, t) => sum + (t.sp ?? 0) * statusProgressRate(t.status ?? null),
+      0
+    );
 
+    // progress-sp-5am に累積SP保存
+    const snapshotKey = `progress-sp-5am:${fullSummary.sprint.id}:${today}`;
     await env.NOTIFY_CACHE.put(snapshotKey, JSON.stringify({
       progress_sp: progressSp,
       timestamp: now.toISOString()
     }), { expirationTtl: config.dedupeTtlSeconds });
 
-    console.log(`Progress SP snapshot saved: ${snapshotKey} = ${progressSp}`);
+    // ダッシュボード履歴にも保存（過去日付を推定値ではなく実測値にする）
+    // これにより24時のダッシュボード生成時に正確なバーンダウン曲線が描ける
+    const dashTasks = await fetchSprintDashboardTasks(config, fullSummary.sprint.id).catch(() => null);
+    if (dashTasks) {
+      const dashSprint = {
+        id: fullSummary.sprint.id,
+        name: fullSummary.sprint.name,
+        start_date: fullSummary.sprint.start_date,
+        end_date: fullSummary.sprint.end_date,
+        status: fullSummary.sprint.status
+      };
+      const snapshot = buildCurrentSpSnapshot(dashSprint, dashTasks, today);
+      const history = await loadSpDashboardHistory(env.NOTIFY_CACHE, fullSummary.sprint.id);
+      await saveSpDashboardSnapshot(env.NOTIFY_CACHE, snapshot, history);
+      console.log(`Dashboard snapshot saved: ${today} teamCompletedSp=${snapshot.teamCompletedSp}`);
+    }
+
+    console.log(`Progress SP snapshot saved: ${snapshotKey} = ${progressSp} (${uniqueTasks.length} unique tasks, progress-rate weighted)`);
     await saveCronHeartbeat(env.NOTIFY_CACHE, "snapshot");
     return { ok: true, reason, progressSp, date: today };
   } catch (error) {
@@ -2297,9 +3832,65 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   const url = new URL(request.url);
   const path = url.pathname;
 
+  // テスト用メッセージ削除
+  if (path === "/test/slack-bullet-cleanup") {
+    const cfg = getConfig(env);
+    if (!cfg.slackBotToken) return jsonResponse({ ok: false, message: "no bot token" });
+    const ch = resolveTeamKChannelId(env);
+    const histRes = await fetch(`https://slack.com/api/conversations.history?channel=${ch}&limit=20`, {
+      headers: { Authorization: `Bearer ${cfg.slackBotToken}` }
+    });
+    const hist = await histRes.json() as { ok: boolean; messages?: Array<{ ts: string; text?: string; bot_id?: string }> };
+    const toDelete = (hist.messages ?? []).filter((m) => m.text?.includes("テストタスク名"));
+    for (const m of toDelete) {
+      await fetch("https://slack.com/api/chat.delete", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cfg.slackBotToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: ch, ts: m.ts })
+      });
+    }
+    return jsonResponse({ ok: true, deleted: toDelete.length });
+  }
+
   if (path === "/health") {
     const heartbeats = await getAllCronHeartbeats(env.NOTIFY_CACHE);
     return jsonResponse({ status: "ok", crons: heartbeats });
+  }
+
+  // Delivery OS read-only snapshot: Notionの案件単価・工数・FTE・Health判定を確認する。
+  if (path === "/pmo/delivery-control") {
+    try {
+      const config = getConfig(env);
+      const now = new Date();
+      const snapshot = await fetchDeliveryControlSnapshot(config, now);
+      const assessments = assessSnapshot(snapshot, now);
+      return jsonResponse({
+        ok: true,
+        snapshot,
+        assessments,
+        updateGaps: collectAssigneeUpdateGaps(snapshot),
+        assigneeCapacity: calculateAssigneeCapacity(snapshot),
+        expansionReminders: collectExpansionReminders(assessments)
+      });
+    } catch (error) {
+      return jsonResponse({ ok: false, error: (error as Error).message }, 500);
+    }
+  }
+
+  if (path === "/pmo/delivery-digest") {
+    return jsonResponse(await runDeliveryMorningFlow(env, "manual"));
+  }
+
+  if (path === "/pmo/delivery-reminder") {
+    return jsonResponse(await runDeliveryUpdateReminderFlow(env, "manual"));
+  }
+
+  if (path === "/pmo/delivery-alerts") {
+    return jsonResponse(await runDeliveryAlertFlow(env, "manual"));
+  }
+
+  if (path === "/pmo/delivery-portfolio") {
+    return jsonResponse(await runDeliveryPortfolioFlow(env, "manual"));
   }
 
   // Admin: send PM report to a specific user's DM (for testing)
@@ -2349,6 +3940,15 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     console.log(`[PM-PROCESSED-BY] /pmo/pm-dismiss endpoint`);
     await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
     return jsonResponse({ ok: true, message: "pm thread marked as processed" });
+  }
+
+  // Debug: resolve a Slack channel name → ID (read-only, conversations.list)
+  if (path === "/pmo/channel-lookup") {
+    const config = getConfig(env);
+    const name = url.searchParams.get("name") || "";
+    if (!config.slackBotToken || !name) return jsonResponse({ ok: false, error: "name required" }, 400);
+    const id = await findChannelIdByName(config.slackBotToken, name);
+    return jsonResponse({ ok: true, name, id });
   }
 
   // Debug: inspect today's PM thread state
@@ -2435,7 +4035,7 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
 
   // 本日の進捗サマリー（手動テスト）: 当日の day-start と現在値を比較してスレッドに投稿
   if (path === "/pmo/progress-summary") {
-    const result = await runDailyProgressSummary(env, "manual");
+    const result = await runDailyProgressSummary(env, "manual", resolveTeamKChannelId(env));
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
@@ -2532,6 +4132,190 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
+  if (path === "/pmo/sprint-tasks-debug") {
+    const config = getConfig(env);
+    const now = new Date();
+    const fullSummary = await fetchCurrentSprintTasksSummary(config, now, { includeCompleted: true }).catch((e) => ({ error: (e as Error).message }));
+    if ("error" in (fullSummary as object)) return jsonResponse({ ok: false, ...(fullSummary as object) });
+    const s = fullSummary as SprintTasksSummary;
+    const allTasks = s.assignees.flatMap((a) => a.tasks.map((t) => ({ assignee: a.name, ...t })));
+    const uniqueById = new Map(allTasks.map((t) => [t.id, t]));
+    return jsonResponse({
+      ok: true,
+      sprint: s.sprint,
+      taskCount: uniqueById.size,
+      tasks: [...uniqueById.values()].map((t) => ({
+        id: t.id,
+        name: t.name,
+        status: t.status,
+        sp: t.sp,
+        isCompleted: isCompletedStatus(t.status ?? null)
+      }))
+    });
+  }
+
+  // debug: 期間内(完了日ベース、スプリント非依存)に完了したタスクを担当者でフィルタして集計する
+  if (path === "/pmo/completed-by-assignee-debug") {
+    const config = getConfig(env);
+    const start = url.searchParams.get("start") || "2026-07-15";
+    const end = url.searchParams.get("end") || "2026-08-21";
+    const assigneeQuery = url.searchParams.get("assignee") || "";
+    const tasks = await fetchCompletedTasksByDateRange(config, { start, end }).catch(
+      (e) => ({ error: (e as Error).message })
+    );
+    if ("error" in (tasks as object)) return jsonResponse({ ok: false, ...(tasks as object) });
+    const filtered = (tasks as Array<{ id: string; name: string; sp: number; status: string | null; assignees: string[]; completedDate: string | null }>).filter(
+      (t) =>
+        isCompletedStatus(t.status) &&
+        (!assigneeQuery || t.assignees.some((a) => a.includes(assigneeQuery)))
+    );
+    const totalSp = filtered.reduce((sum, t) => sum + t.sp, 0);
+    return jsonResponse({
+      ok: true,
+      range: { start, end },
+      assignee: assigneeQuery || "(all)",
+      taskCount: filtered.length,
+      totalSp,
+      tasks: filtered.map((t) => ({
+        name: t.name,
+        sp: t.sp,
+        status: t.status,
+        assignees: t.assignees,
+        completedDate: t.completedDate
+      }))
+    });
+  }
+
+  // debug: 期間内(期限ベースの週次スプリントをまたいで走査)の完了タスクを、担当者×プロジェクトで集計する
+  if (path === "/pmo/completed-by-project-debug") {
+    const config = getConfig(env);
+    const start = url.searchParams.get("start") || "2026-07-15";
+    const end = url.searchParams.get("end") || "2026-08-21";
+    const assigneeQuery = url.searchParams.get("assignee") || "";
+    const sprints = await fetchAllSprints(config).catch(() => []);
+    const overlapping = sprints.filter((s) => s.start_date <= end && s.end_date >= start);
+    const byId = new Map<string, SprintDashboardTask>();
+    for (const sprint of overlapping) {
+      const tasks = await fetchSprintDashboardTasks(config, sprint.id).catch(() => []);
+      for (const t of tasks) byId.set(t.id, t);
+    }
+    const filtered = [...byId.values()].filter(
+      (t) =>
+        isCompletedStatus(t.status) &&
+        (!assigneeQuery || t.assignees.some((a) => a.includes(assigneeQuery)))
+    );
+    const byProject = new Map<string, { sp: number; count: number; names: string[] }>();
+    for (const t of filtered) {
+      const key = t.projectNames[0] || "(プロジェクト未設定)";
+      const entry = byProject.get(key) || { sp: 0, count: 0, names: [] };
+      entry.sp += t.sp;
+      entry.count += 1;
+      entry.names.push(t.name);
+      byProject.set(key, entry);
+    }
+    return jsonResponse({
+      ok: true,
+      range: { start, end },
+      assignee: assigneeQuery || "(all)",
+      sprintsScanned: overlapping.map((s) => s.name),
+      taskCount: filtered.length,
+      totalSp: filtered.reduce((sum, t) => sum + t.sp, 0),
+      byProject: Object.fromEntries(byProject)
+    });
+  }
+
+  // debug: ステータスが「完了」になった日(完了日、無ければ最終更新日で代替)が [start, end] のタスクを担当者×プロジェクトで一覧する
+  if (path === "/pmo/completed-window-debug") {
+    const config = getConfig(env);
+    const start = url.searchParams.get("start") || "2026-08-15";
+    const end = url.searchParams.get("end") || "2026-08-21";
+    const assigneeQuery = url.searchParams.get("assignee") || "";
+    const sprints = await fetchAllSprints(config).catch(() => []);
+    const byId = new Map<string, SprintDashboardTask>();
+    for (const sprint of sprints) {
+      const tasks = await fetchSprintDashboardTasks(config, sprint.id).catch(() => []);
+      for (const t of tasks) byId.set(t.id, t);
+    }
+    const withEffectiveDate = [...byId.values()].map((t) => ({
+      ...t,
+      effectiveDate: t.completedDate ?? t.lastEditedDate,
+      dateSource: t.completedDate ? "完了日" : "最終更新日(代替)"
+    }));
+    const filtered = withEffectiveDate.filter(
+      (t) =>
+        isCompletedStatus(t.status) &&
+        (!assigneeQuery || t.assignees.some((a) => a.includes(assigneeQuery))) &&
+        t.effectiveDate &&
+        t.effectiveDate >= start &&
+        t.effectiveDate <= end
+    );
+    return jsonResponse({
+      ok: true,
+      range: { start, end },
+      assignee: assigneeQuery || "(all)",
+      taskCount: filtered.length,
+      totalSp: filtered.reduce((sum, t) => sum + t.sp, 0),
+      tasks: filtered.map((t) => ({
+        name: t.name,
+        sp: t.sp,
+        project: t.projectNames[0] ?? "(プロジェクト未設定)",
+        assignees: t.assignees,
+        effectiveDate: t.effectiveDate,
+        dateSource: t.dateSource
+      }))
+    });
+  }
+
+  // debug: webhook でステータス→完了を検知した瞬間の永続ログを一覧する(完了日プロパティに依存しない正確な記録)
+  if (path === "/pmo/completed-log-debug") {
+    const start = url.searchParams.get("start");
+    const end = url.searchParams.get("end");
+    const assigneeQuery = url.searchParams.get("assignee") || "";
+    const projectQuery = url.searchParams.get("project") || "";
+    const all = await listTaskCompletions(env.NOTIFY_CACHE);
+    const toJstDate = (iso: string) =>
+      new Date(new Date(iso).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const filtered = all.filter((t: TaskCompletionRecord) => {
+      const day = toJstDate(t.completedAt);
+      if (start && day < start) return false;
+      if (end && day > end) return false;
+      if (assigneeQuery && !t.assignees.some((a) => a.includes(assigneeQuery))) return false;
+      if (projectQuery && !(t.project ?? "").includes(projectQuery)) return false;
+      return true;
+    });
+    return jsonResponse({
+      ok: true,
+      range: { start: start ?? "(all)", end: end ?? "(all)" },
+      assignee: assigneeQuery || "(all)",
+      project: projectQuery || "(all)",
+      taskCount: filtered.length,
+      totalSp: filtered.reduce((sum, t) => sum + (t.sp ?? 0), 0),
+      tasks: filtered.map((t) => ({
+        name: t.name,
+        sp: t.sp,
+        project: t.project,
+        assignees: t.assignees,
+        completedAtJst: toJstDate(t.completedAt),
+        completedAt: t.completedAt
+      }))
+    });
+  }
+
+  // debug: 指定ページIDの生プロパティをそのまま返す(フィールド名・値の確認用)
+  if (path === "/pmo/task-raw-debug") {
+    const config = getConfig(env);
+    const id = url.searchParams.get("id");
+    if (!id) return jsonResponse({ ok: false, error: "id query param required" }, 400);
+    const res = await fetch(`https://api.notion.com/v1/pages/${id}`, {
+      headers: {
+        Authorization: `Bearer ${config.notionToken}`,
+        "Notion-Version": "2022-06-28"
+      }
+    });
+    const data = (await res.json()) as any;
+    return jsonResponse({ ok: res.ok, status: res.status, properties: data?.properties ?? data });
+  }
+
   if (path === "/pmo/burndown") {
     // ?sprint=s16 で指定。未指定なら現スプリント(期間内 or 進行中)。
     const config = getConfig(env);
@@ -2567,6 +4351,437 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     if (!png) return jsonResponse({ ok: false, error: "burndown png failed" }, 500);
     await uploadImageToSlack(config.slackBotToken, channel, undefined, `burndown-${sprint.name}.png`, png, `【バーンダウン】 ${sprint.name}`);
     return jsonResponse({ ok: true, sprint: sprint.name, total: series.total, taskCount: tasks.length });
+  }
+
+  if (path === "/pmo/sprint-planning") {
+    const result = await runSprintPlanningFlow(
+      env,
+      "manual",
+      resolveTeamKChannelId(env)
+    );
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // 計画Lock後のScope差分を読み取り専用で確認する。
+  if (path === "/pmo/sprint-scope") {
+    try {
+      const state = await prepareSprintScopeFlowState(env);
+      return jsonResponse(
+        state
+          ? { ok: true, diff: state.diff, message: renderSprintScopeDiff(state.diff) }
+          : { ok: true, skipped: true, reason: "baseline or current sprint not found" }
+      );
+    } catch (error) {
+      return jsonResponse({ ok: false, error: (error as Error).message }, 500);
+    }
+  }
+
+  if (path === "/pmo/sprint-scope-alert") {
+    const result = await runSprintScopeControlFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // チャンネルの最新ファイル投稿を削除するエンドポイント（前回の dashboard 投稿を消すため）。
+  // ?count=N で削除件数（デフォルト2）、?channel_id=xxx でチャンネルを直接指定可。
+  // 指定スレッド(親+返信全件)をまとめて削除する後始末用エンドポイント。?channel=...&ts=<parentTs>
+  if (path === "/pmo/delete-thread") {
+    const config = getConfig(env);
+    if (!config.slackBotToken) return jsonResponse({ ok: false, error: "SLACK_BOT_TOKEN not set" }, 400);
+    const channel = url.searchParams.get("channel") || "";
+    const parentTs = url.searchParams.get("ts") || "";
+    if (!channel || !parentTs) return jsonResponse({ ok: false, error: "channel, ts は必須" }, 400);
+    const replies = await conversationsReplies(config.slackBotToken, channel, parentTs, 100, true).catch(() => []);
+    const targets = replies.length > 0 ? replies.map((m) => m.ts) : [parentTs];
+    const results: Array<{ ts: string; deleted: boolean }> = [];
+    for (const ts of targets) {
+      const deleted = await deleteSlackMessage(config.slackBotToken, channel, ts).catch(() => false);
+      results.push({ ts, deleted });
+    }
+    return jsonResponse({ ok: true, channel, parentTs, count: results.length, results });
+  }
+
+  if (path === "/pmo/delete-last-dashboard") {
+    const config = getConfig(env);
+    if (!config.slackBotToken) return jsonResponse({ ok: false, error: "SLACK_BOT_TOKEN not set" }, 400);
+    const count = Math.min(10, parseInt(url.searchParams.get("count") ?? "2", 10));
+    const channelName = env.S19_SCREENSHOT_CHANNEL || "team-k-古鉄";
+    const channelId = url.searchParams.get("channel_id") ||
+      env.S19_SCREENSHOT_CHANNEL_ID ||
+      (await findChannelIdByName(config.slackBotToken, channelName));
+    if (!channelId) return jsonResponse({ ok: false, error: `channel not found: ${channelName}` }, 400);
+
+    const histRes = await fetch(`https://slack.com/api/conversations.history?channel=${channelId}&limit=20`, {
+      headers: { Authorization: `Bearer ${config.slackBotToken}` }
+    });
+    const hist = (await histRes.json()) as { ok: boolean; messages?: Array<{ ts?: string; files?: unknown[] }> };
+    if (!hist.ok) return jsonResponse({ ok: false, error: "conversations.history failed" }, 500);
+
+    const fileMsgs = (hist.messages ?? []).filter((m) => Array.isArray(m.files) && m.files.length > 0);
+    const toDelete = fileMsgs.slice(0, count);
+    const results: Array<{ ts: string; deleted: boolean }> = [];
+    for (const msg of toDelete) {
+      if (!msg.ts) continue;
+      const deleted = await deleteSlackMessage(config.slackBotToken, channelId, msg.ts);
+      results.push({ ts: msg.ts, deleted });
+    }
+    return jsonResponse({ ok: true, deleted: results.length, results });
+  }
+
+  // 特定の1投稿を channel_id + ts 指定で削除するエンドポイント（bot 自身の投稿のみ削除可）。
+  // ts は Slack パーマリンの p1234567890123456 部分を "1234567890.123456" 形式に変換して渡す。
+  if (path === "/pmo/delete-message") {
+    const config = getConfig(env);
+    if (!config.slackBotToken) return jsonResponse({ ok: false, error: "SLACK_BOT_TOKEN not set" }, 400);
+    const channelId = url.searchParams.get("channel_id");
+    const ts = url.searchParams.get("ts");
+    if (!channelId || !ts) return jsonResponse({ ok: false, error: "channel_id and ts are required" }, 400);
+    const deleted = await deleteSlackMessage(config.slackBotToken, channelId, ts);
+    return jsonResponse({ ok: deleted, channel_id: channelId, ts });
+  }
+
+  if (path === "/pmo/sp-dashboard" || path === "/pmo/sp-dashboard-v2") {
+    const config = getConfig(env);
+    const rawDate = url.searchParams.get("date");
+    if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      return jsonResponse({ ok: false, error: "date must be YYYY-MM-DD" }, 400);
+    }
+    const reportDate = rawDate ?? toJstDateString(new Date());
+    const sprintName = url.searchParams.get("sprint");
+    const debug = url.searchParams.get("debug");
+
+    try {
+      if (
+        debug === "data" ||
+        debug === "html" ||
+        debug === "png" ||
+        debug === "details-data" ||
+        debug === "details-html" ||
+        debug === "details-png"
+      ) {
+        const prepared = await prepareSpGamificationDashboard(env, {
+          reportDate,
+          sprintName,
+          persistSnapshot: false
+        });
+        if (debug === "data") {
+          return jsonResponse({
+            ok: true,
+            taskCount: prepared.taskCount,
+            data: prepared.data
+          });
+        }
+        if (debug === "details-data") {
+          return jsonResponse({
+            ok: true,
+            taskCount: prepared.taskCount,
+            details: prepared.details
+          });
+        }
+        const background =
+          url.searchParams.get("ai") === "1"
+            ? await generateAiDashboardBackground(config, prepared.data)
+            : { base64: null, model: config.openaiImageModel, error: "disabled" };
+        if (debug === "html") {
+          return new Response(renderSpDashboardHtml(prepared.data, background), {
+            headers: { "Content-Type": "text/html; charset=utf-8" }
+          });
+        }
+        if (debug === "details-html") {
+          return new Response(
+            renderSpTaskDetailsHtml(prepared.details, background),
+            { headers: { "Content-Type": "text/html; charset=utf-8" } }
+          );
+        }
+        const png =
+          debug === "details-png"
+            ? await buildSpTaskDetailsPng(
+                env.BROWSER,
+                prepared.details,
+                background
+              )
+            : await buildSpDashboardPng(
+                env.BROWSER,
+                prepared.data,
+                background
+              );
+        if (!png) {
+          return jsonResponse(
+            {
+              ok: false,
+              error:
+                debug === "details-png"
+                  ? "task details PNG render failed"
+                  : "dashboard PNG render failed"
+            },
+            500
+          );
+        }
+        return new Response(png as unknown as BodyInit, {
+          headers: {
+            "Content-Type": "image/png",
+            "X-AI-Theme-Used": String(!!background.base64),
+            ...(background.error
+              ? { "X-AI-Theme-Error": encodeURIComponent(background.error.slice(0, 180)) }
+              : {})
+          }
+        });
+      }
+
+      // ?to=dm は本番チャンネルへ送らず、古鉄の DM へ実画像を投稿する受入テスト用。
+      let channelId: string | undefined;
+      if (url.searchParams.get("to") === "dm") {
+        if (config.slackBotToken && config.slackPmUserId) {
+          channelId = await conversationsOpen(
+            config.slackBotToken,
+            config.slackPmUserId
+          ).catch(() => undefined);
+        }
+        if (!channelId) {
+          return jsonResponse(
+            { ok: false, error: "DM open failed (SLACK_PM_USER_ID 未設定?)" },
+            400
+          );
+        }
+      }
+      const result = await runSpGamificationDashboard(env, "manual", {
+        channelId,
+        reportDate,
+        sprintName,
+        useAi: url.searchParams.get("noai") !== "1"
+      });
+      return jsonResponse(result, result.ok ? 200 : 500);
+    } catch (error) {
+      return jsonResponse(
+        { ok: false, error: (error as Error).message ?? "unknown error" },
+        500
+      );
+    }
+  }
+
+  if (path === "/pmo/s19-screenshot") {
+    const resolveDebugTarget = (): string => resolveDailyKpiTarget(env, { explicitUrl: url.searchParams.get("url") }).url;
+    const parseDebugDateParam = (): { m: number; d: number } | null => {
+      const dq = url.searchParams.get("date");
+      if (!dq) return null;
+      const md = dq.match(/(\d{1,2})\D+(\d{1,2})/);
+      return md ? { m: parseInt(md[1], 10), d: parseInt(md[2], 10) } : null;
+    };
+
+    // ?debug=png → Slack送信せずスクショPNGを返す（確認用）
+    if (url.searchParams.get("debug") === "probe") {
+      const info = await probeBrowserCapabilities(env.BROWSER);
+      return jsonResponse(info);
+    }
+    if (url.searchParams.get("debug") === "measure") {
+      const session = await getNotionSession(env.NOTIFY_CACHE);
+      const target = resolveDebugTarget();
+      const info = await debugNotionTableMeasure(env.BROWSER, session, target);
+      return jsonResponse({ hasSession: !!session, ...info });
+    }
+    if (url.searchParams.get("debug") === "trap") {
+      const session = await getNotionSession(env.NOTIFY_CACHE);
+      const target = resolveDebugTarget();
+      const info = await debugNotionRedirectTrap(env.BROWSER, session, target);
+      return jsonResponse({ hasSession: !!session, ...info });
+    }
+    if (url.searchParams.get("debug") === "info") {
+      const session = await getNotionSession(env.NOTIFY_CACHE);
+      const target = resolveDebugTarget();
+      const jsEnabled = url.searchParams.get("js") !== "off";
+      const info = await debugNotionPageInfo(env.BROWSER, session, target, jsEnabled);
+      return jsonResponse({ hasSession: !!session, ...info });
+    }
+    if (url.searchParams.get("debug") === "png") {
+      const config = getConfig(env);
+      const session = await getNotionSession(env.NOTIFY_CACHE);
+      if (!session) return jsonResponse({ ok: false, error: "no notion session" }, 400);
+      const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
+      const target = resolveDebugTarget();
+      const clipToTable = url.searchParams.get("full") !== "1"; // 既定: デイリー KPI表のみ。?full=1 でページ全体
+      const dateParam = parseDebugDateParam();
+      let matchLabel: string | undefined;
+      if (clipToTable && dateParam) {
+        const t = await fetchScrumTable(config, target, { month: dateParam.m, day: dateParam.d }).catch(() => null);
+        matchLabel = t?.dateColumns.find((c) => c.month === dateParam.m && c.day === dateParam.d)?.label;
+      }
+      const png = await captureNotionPage(env.BROWSER, session, target, avatarMap, clipToTable, matchLabel);
+      if (!png) return jsonResponse({ ok: false, error: "screenshot failed" }, 500);
+      return new Response(png as unknown as BodyInit, { headers: { "Content-Type": "image/png" } });
+    }
+    // debug=table → Notion API での表パース結果を確認（動作確認用。?date=M/D で対象表を指定）
+    if (url.searchParams.get("debug") === "table") {
+      const config = getConfig(env);
+      const target = resolveDebugTarget();
+      const dateParam = parseDebugDateParam();
+      const t = await fetchScrumTable(config, target, dateParam ? { month: dateParam.m, day: dateParam.d } : undefined).catch(
+        (e) => ({ error: (e as Error).message })
+      );
+      if (!t || "error" in (t as object)) return jsonResponse({ ok: false, ...(t as object) });
+      const tbl = t as ScrumTable;
+      let emptyInfo: unknown = null;
+      if (dateParam) {
+        const ci = dateColumnIndex(tbl, dateParam.m, dateParam.d);
+        emptyInfo = ci == null ? "column not found" : { colIndex: ci, empty: emptyMembersForColumn(tbl, ci) };
+      }
+      const memberNames = [...new Set(tbl.rows.map((r) => r.member).filter(Boolean))];
+      const members = await fetchMembers(config).catch(() => []);
+      const mentionCheck = memberNames.map((n) => {
+        const sid = resolveSlackId(members, config, n);
+        return { name: n, slackId: sid ?? null, mention: sid ? `<@${sid}>` : `(plain) ${n}` };
+      });
+      return jsonResponse({
+        ok: true,
+        tableId: tbl.tableId,
+        headers: tbl.headers,
+        dateColumns: tbl.dateColumns,
+        rowCount: tbl.rows.length,
+        members: memberNames,
+        mentionCheck,
+        emptyInfo,
+        rows: tbl.rows
+      });
+    }
+    // 旧デイリーKPI投稿+10分おきリマインド(runS19DailyPost/runS19ReminderTick)は
+    // KPI実行担保エンジン（/pmo/kpi-morning, /pmo/kpi-evening, /pmo/kpi-board）に置き換え済み。
+    // 上記の debug=probe/measure/trap/info/png/table は汎用デバッグツールとして引き続き利用可能。
+    return jsonResponse({
+      ok: false,
+      error: "廃止されました。/pmo/kpi-morning, /pmo/kpi-evening, /pmo/kpi-board を使ってください（?debug=probe|measure|trap|info|png|table は引き続き利用可能）"
+    }, 410);
+  }
+
+  // debug: KPIテキストの頻度(cadence)推論結果を確認する（Slack投稿なし）
+  if (path === "/pmo/kpi-cadence-debug") {
+    const config = getConfig(env);
+    const target = resolveDailyKpiTarget(env, { explicitUrl: url.searchParams.get("url") });
+    const dq = url.searchParams.get("date");
+    const md = dq ? dq.match(/(\d{1,2})\D+(\d{1,2})/) : null;
+    const targetDate = md ? { m: parseInt(md[1], 10), d: parseInt(md[2], 10) } : jstTodayMD();
+    const table = await fetchScrumTable(config, target.url, { month: targetDate.m, day: targetDate.d }).catch(() => null);
+    if (!table) return jsonResponse({ ok: false, error: "KPI table not found for target date" }, 500);
+    const rows = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+    return jsonResponse({
+      ok: true,
+      targetDate,
+      tableId: table.tableId,
+      count: rows.length,
+      results: rows.map((r) => ({ member: r.member, kpiText: r.kpiText, itemKey: r.itemKey, cadence: r.cadence }))
+    });
+  }
+
+  // debug: KPIの危険度判定（重い/要注意/未達成）を確認する（Slack投稿なし）
+  // ?slot=morning|evening（既定 evening）、?date=M/D でテーブル・today基準日を指定
+  if (path === "/pmo/kpi-risk-debug") {
+    const config = getConfig(env);
+    const target = resolveDailyKpiTarget(env, { explicitUrl: url.searchParams.get("url") });
+    const dq = url.searchParams.get("date");
+    const md = dq ? dq.match(/(\d{1,2})\D+(\d{1,2})/) : null;
+    const targetDate = md ? { m: parseInt(md[1], 10), d: parseInt(md[2], 10) } : jstTodayMD();
+    const timeSlot = url.searchParams.get("slot") === "morning" ? "morning" : "evening";
+    const table = await fetchScrumTable(config, target.url, { month: targetDate.m, day: targetDate.d }).catch(() => null);
+    if (!table) return jsonResponse({ ok: false, error: "KPI table not found for target date" }, 500);
+    const rows = await buildKpiRowContexts(config, env.NOTIFY_CACHE, table);
+    const riskItems = computeKpiRiskAssessment(rows, table, { month: targetDate.m, day: targetDate.d }, timeSlot);
+    const todayColPos = table.dateColumns.findIndex((c) => c.month === targetDate.m && c.day === targetDate.d);
+
+    const memberNames = [...new Set(rows.map((r) => r.member))];
+    const memoryByMember = new Map<string, KpiMemberMemory>();
+    for (const m of memberNames) memoryByMember.set(m, await getKpiMemory(env.NOTIFY_CACHE, m));
+    const commitmentChecks = resolvePendingCommitments(rows, table, memoryByMember, todayColPos);
+
+    return jsonResponse({
+      ok: true,
+      targetDate,
+      timeSlot,
+      tableId: table.tableId,
+      riskCount: riskItems.length,
+      riskItems,
+      commitmentChecks
+    });
+  }
+
+  // KPI実行担保エンジン: 08:40 朝スレッド投稿を手動実行。?to=dm で本番チャンネルの代わりにPMのDMへ（動作確認用）
+  if (path === "/pmo/kpi-morning") {
+    let channelId: string | undefined;
+    if (url.searchParams.get("to") === "dm") {
+      const cfg = getConfig(env);
+      if (cfg.slackBotToken && cfg.slackPmUserId) {
+        channelId = await conversationsOpen(cfg.slackBotToken, cfg.slackPmUserId).catch(() => undefined);
+      }
+      if (!channelId) return jsonResponse({ ok: false, error: "DM open failed (SLACK_PM_USER_ID 未設定?)" }, 400);
+    }
+    const dq = url.searchParams.get("date");
+    const dm = dq ? dq.match(/(\d{1,2})\D+(\d{1,2})/) : null;
+    const overrideDate = dm ? { m: parseInt(dm[1], 10), d: parseInt(dm[2], 10) } : undefined;
+    const result = await runKpiMorningPost(env, "manual", { channelId, overrideDate });
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // KPI実行担保エンジン: 18:00/21:00 エスカレーションチェックを手動実行。?slot=1800|2100（既定1800）
+  if (path === "/pmo/kpi-evening") {
+    let channelId: string | undefined;
+    if (url.searchParams.get("to") === "dm") {
+      const cfg = getConfig(env);
+      if (cfg.slackBotToken && cfg.slackPmUserId) {
+        channelId = await conversationsOpen(cfg.slackBotToken, cfg.slackPmUserId).catch(() => undefined);
+      }
+      if (!channelId) return jsonResponse({ ok: false, error: "DM open failed (SLACK_PM_USER_ID 未設定?)" }, 400);
+    }
+    const dq = url.searchParams.get("date");
+    const dm = dq ? dq.match(/(\d{1,2})\D+(\d{1,2})/) : null;
+    const overrideDate = dm ? { m: parseInt(dm[1], 10), d: parseInt(dm[2], 10) } : undefined;
+    const slot = url.searchParams.get("slot") === "2100" ? "2100" : "1800";
+    const result = await runKpiEveningCheck(env, "manual", slot, { channelId, overrideDate });
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // KPI実行担保エンジン: 25:00(=01:00) の表投稿を手動実行。?to=dm でPMのDMへ（動作確認用）
+  if (path === "/pmo/kpi-board") {
+    let channelId: string | undefined;
+    if (url.searchParams.get("to") === "dm") {
+      const cfg = getConfig(env);
+      if (cfg.slackBotToken && cfg.slackPmUserId) {
+        channelId = await conversationsOpen(cfg.slackBotToken, cfg.slackPmUserId).catch(() => undefined);
+      }
+      if (!channelId) return jsonResponse({ ok: false, error: "DM open failed (SLACK_PM_USER_ID 未設定?)" }, 400);
+    }
+    const dq = url.searchParams.get("date");
+    const dm = dq ? dq.match(/(\d{1,2})\D+(\d{1,2})/) : null;
+    const overrideDate = dm ? { m: parseInt(dm[1], 10), d: parseInt(dm[2], 10) } : undefined;
+    const result = await runKpiBoardPost(env, "manual", { channelId, overrideDate });
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // KPI実行担保エンジン: 00:00〜08:20 の未記入リマインド/完了スクショ判定を手動実行（動作確認用）。
+  if (path === "/pmo/kpi-midnight-check") {
+    const result = await runKpiMidnightFillCheck(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  // debug: KPI詰めスレッドへの返信を、実際のSlackイベントなしでシミュレートする
+  // （署名検証済みSlack Events APIを経由せずに handleKpiReply 相当のコアロジックを直接叩く）
+  if (path === "/pmo/kpi-reply-debug") {
+    const channel = url.searchParams.get("channel") || "";
+    const threadTs = url.searchParams.get("threadTs") || "";
+    const userId = url.searchParams.get("userId") || "";
+    const text = url.searchParams.get("text") || "";
+    if (!channel || !threadTs || !userId || !text) {
+      return jsonResponse({ ok: false, error: "channel, threadTs, userId, text は必須" }, 400);
+    }
+    const result = await processKpiReply(env, { channel, threadTs, userId, text });
+    return jsonResponse(result, result.ok ? 200 : 400);
+  }
+
+  // debug: 特定メンバーの長期記憶(kpiMemory)を確認/消去する（?clear=1で消去、本番では通常使わない）
+  if (path === "/pmo/kpi-memory-debug") {
+    const member = url.searchParams.get("member") || "";
+    if (!member) return jsonResponse({ ok: false, error: "member は必須" }, 400);
+    if (url.searchParams.get("clear") === "1") {
+      await clearKpiMemory(env.NOTIFY_CACHE, member);
+      return jsonResponse({ ok: true, cleared: member });
+    }
+    const memory = await getKpiMemory(env.NOTIFY_CACHE, member);
+    return jsonResponse({ ok: true, memory });
   }
 
   if (path === "/pmo/reminder") {
@@ -2619,6 +4834,51 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     const config = getConfig(env);
     const users = await getCachedUsers(env.NOTIFY_CACHE, config.teamFilter);
     return jsonResponse({ ok: true, teamFilter: config.teamFilter, count: users.length, users });
+  }
+
+  if (path === "/pmo/post-thread" && request.method === "POST") {
+    const config = getConfig(env);
+    if (!config.slackBotToken) return jsonResponse({ ok: false, error: "no bot token" }, 400);
+    const body = await request.json() as { channel: string; thread_ts: string; text: string };
+    const res = await chatPostMessage(config.slackBotToken, body.channel, body.text, undefined, body.thread_ts);
+    return jsonResponse(res);
+  }
+
+  if (path === "/pmo/screenshot-to-thread" && request.method === "POST") {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const config = getConfig(env);
+    const body = await request.json() as { channel: string; thread_ts: string };
+    const task = (async () => {
+      try {
+        if (!config.slackBotToken) { await writer.write(new TextEncoder().encode("no bot token")); return; }
+        const url = resolveDailyKpiTarget(env).url;
+        const now = new Date();
+        const td = jstYesterdayMD(now.getTime());
+        const table = await fetchScrumTable(config, url, { month: td.m, day: td.d }).catch(() => null);
+        const dateLabel = (() => {
+          if (!table) return `${td.m}/${td.d}`;
+          const ci = dateColumnIndex(table, td.m, td.d);
+          return table.dateColumns.find((c) => c.index === ci)?.label ?? `${td.m}/${td.d}`;
+        })();
+        const session = await getNotionSession(env.NOTIFY_CACHE);
+        const avatarMap = await fetchNotionAvatarMap(config.notionToken).catch(() => ({}));
+        const png = await captureNotionPage(env.BROWSER, session, url, avatarMap, true, dateLabel);
+        if (png) {
+          const today = toJstDateString(now);
+          await uploadImageToSlack(config.slackBotToken, body.channel, body.thread_ts, `kpi-${today}.png`, png, undefined);
+        }
+        if (table) {
+          const play = await buildLivePlay(config, table, dateLabel).catch(() => null);
+          if (play) await chatPostMessage(config.slackBotToken, body.channel, `📣 *実況* — ${dateLabel} の達成状況\n${play}`, undefined, body.thread_ts);
+        }
+      } finally {
+        await writer.write(new TextEncoder().encode("ok"));
+        await writer.close();
+      }
+    })();
+    if (ctx) ctx.waitUntil(task);
+    return new Response(readable, { status: 200 });
   }
 
   if (path === "/query" && request.method === "POST") {
@@ -2778,11 +5038,106 @@ async function runForAllChannels(
   }
 }
 
+/**
+ * 24:00 JST の投稿を順番に実行する。
+ * SPRINT CONTROL は、他の日次投稿が完了した後に必ず最後に送る。
+ */
+async function runMidnightPostSequence(env: Env): Promise<void> {
+  const taskChannel = resolveTeamKChannelId(env);
+  const dailySummary = await runDailyProgressSummary(env, "cron", taskChannel).catch((error) => {
+    console.error("Daily progress cron failed", error);
+    return { ok: false, error: (error as Error).message };
+  });
+  const dailySummaryRecord = dailySummary as Record<string, unknown>;
+  const threadTs =
+    typeof dailySummaryRecord.threadTs === "string"
+      ? dailySummaryRecord.threadTs
+      : await getCurrentTaskThread(env.NOTIFY_CACHE, taskChannel).catch(() => null);
+  const result = await runSpGamificationDashboard(env, "cron", {
+    channelId: taskChannel,
+    threadTs: threadTs ?? undefined
+  }).catch(
+    (error) => ({ ok: false, error: (error as Error).message })
+  );
+  if (!result.ok) console.error("SPRINT CONTROL cron failed", result);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     return handleHttp(request, env, ctx);
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    // 単一の */10 cron に集約（Cloudflare cron 上限対策）。日次ジョブは JST 時刻ゲートで発火。
+    if (event.cron === "*/10 * * * *") {
+      const now = new Date();
+      const jstH = (now.getUTCHours() + 9) % 24;
+      const jstM = now.getUTCMinutes();
+      const jstDow = new Date(now.getTime() + 9 * 3600 * 1000).getUTCDay();
+      const hm = jstH * 100 + jstM;
+      // タスクリマインド・KPIイベントは独立して判定（複数同時実行あり）
+      if (hm === 830) {
+        ctx.waitUntil(runTaskReminderFlow(env, "cron", resolveTeamKChannelId(env))); // 08:30 JST タスクリマインド(full)
+      }
+      if (hm === 840) {
+        // 08:40 JST — KPI実行担保エンジン: 朝スレッド投稿 + 着手リスクのある人への質問
+        await runKpiMorningPost(env, "cron");
+      }
+      if (hm === 850) {
+        // 08:50 JST — 当日タスクスレッドへ案件採算・FTE・HealthのDigest画像を投稿。
+        // 単一cronが10分粒度のため、Runbookの08:45に最も近い08:50で実行する。
+        await runDeliveryMorningFlow(env, "cron");
+        await runSprintScopeControlFlow(env, "cron");
+        if (jstDow === 6) {
+          // 土曜 = 仮想Sprint開始日。Digestの後にPlanning診断を投稿する。
+          await runSprintPlanningFlow(env, "cron", resolveTeamKChannelId(env));
+        }
+      }
+      if (hm === 1200) {
+        // 正午にForecast/Burn/Blockerの状態変化を再評価する（同一状態はKVで抑止）。
+        await runDeliveryAlertFlow(env, "cron");
+        // 朝以降に追加されたSprint Scopeも、同一差分を重複せず検知する。
+        await runSprintScopeControlFlow(env, "cron");
+      }
+      if (hm === 1750 && jstDow === 5) {
+        // 金曜夕方 — 案件Portfolioと担当者別の次週FTE需要。
+        await runDeliveryPortfolioFlow(env, "cron");
+      }
+      if (hm === 1830) {
+        // 18:30 JST — 未更新タスクのみ、担当者単位に集約してリマインド。
+        await runDeliveryUpdateReminderFlow(env, "cron");
+      }
+      if (hm === 1400) {
+        ctx.waitUntil(runTaskReminderFlow(env, "midday", resolveTeamKChannelId(env))); // 14:00 JST 追記リマインド
+      }
+      if (hm === 2000) {
+        ctx.waitUntil(runTaskReminderFlow(env, "evening", resolveTeamKChannelId(env))); // 20:00 JST 追記リマインド
+      }
+      if (hm === 1800) {
+        // 18:00 JST — KPI実行担保エンジン: エスカレーションチェック(1回目)
+        await runKpiEveningCheck(env, "cron", "1800");
+      }
+      if (hm === 2100) {
+        // 21:00 JST — KPI実行担保エンジン: エスカレーションチェック(2回目)
+        await runKpiEveningCheck(env, "cron", "2100");
+      }
+      if (hm === 0) {
+        // 24:00 JST — 本日の進捗サマリー + KPI投稿 + SPRINT CONTROL。
+        // scheduled() の Promise を直接待つことで Cron の15分枠を使う。
+        // 日次投稿を直列化し、SPRINT CONTROL を一連処理の最後に送る。
+        await runMidnightPostSequence(env);
+      }
+      // 09:00〜17:50 JST — 未返信者への15分間隔リマインド（KPI朝投稿後〜夕方エスカレ前）
+      // runKpiMiddayFollowup 内で lastPromptAt チェックし15分未満ならスキップする
+      if (hm >= 900 && hm < 1800 && hm !== 840) {
+        await runKpiMiddayFollowup(env, "cron");
+      }
+      // 00:00〜08:20 JST(10分おき) — 当日のKPI表がまだ未記入なら10分おきにリマインド。
+      // 全員記入済みになったら、その週のKPI表のスクショをスレッドに投稿する（runKpiMidnightFillCheck内でゲート）。
+      if (hm >= 0 && hm < 830) {
+        ctx.waitUntil(runKpiMidnightFillCheck(env, "cron"));
+      }
+      return;
+    }
     // Branch by cron expression
     if (event.cron === "0 20 * * *") {
       // 05:00 JST — Save progress SP snapshot + refresh project & user catalogs
@@ -2799,8 +5154,8 @@ export default {
       // 20:00 JST — タスク状況の追記リマインド（当日スレッドにテキスト追記）
       ctx.waitUntil(runTaskReminderFlow(env, "evening"));
     } else if (event.cron === "0 15 * * *") {
-      // 24:00 JST(翌0時) — 本日の進捗サマリー（各メンバーの進捗SPと進捗タスクを当日スレッドに）
-      ctx.waitUntil(runDailyProgressSummary(env, "cron"));
+      // 24:00 JST(翌0時) — 日次投稿の最後に SPRINT CONTROL を送信
+      await runMidnightPostSequence(env);
     } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runForAllChannels(env, (ch) => runMorningFlow(env, "cron", null, ch)));
