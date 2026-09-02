@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -229,3 +230,18 @@ output/
 # 個人・他案件メモ(コミット不要)
 川崎設備タスク.md
 shell-loop-task-list.md
+
+# Claude Code — 配布先リポジトリで .claude/ が既にignoreされている場合に
+# skills/ と settings.json を確実にtrackさせるための否定パターン。
+# このテンプレートを適用する際、対象リポジトリの .gitignore に
+# .claude/* が含まれていると skills がcommitできなくなるため、
+# 否定ルール (!.claude/skills/) で上書きして回避する。
+.claude/*
+!.claude/skills/
+!.claude/settings.json
+
+Thumbs.db
+
+# Environment variables
+.env.*
+!.env.example

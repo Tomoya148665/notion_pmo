@@ -1,0 +1,45 @@
+# .github/workflows/claude-review.yml
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  # PR作成時の自動レビュー
+  auto-review:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+      id-token: write
+    uses: AICE-inc/claude-code-review-workflow/.github/workflows/claude-auto-review.yml@main
+    with:
+      repo_name: ${{ github.repository }}
+      pr_number: ${{ github.event.pull_request.number }}
+      pr_head_ref: ${{ github.event.pull_request.head.ref }}
+    secrets:
+      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CODE_REVIEW }}
+
+  # @claude メンションによる手動レビュー
+  mention-review:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+      id-token: write
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+    uses: AICE-inc/claude-code-review-workflow/.github/workflows/claude-mention-review.yml@main
+    secrets:
+      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CODE_REVIEW }}
